@@ -75,6 +75,7 @@
     }
   },
   "devDependencies": {
+    "@types/node": "^25.5.2",
     "@types/react-native": "^0.72.8",
     "@types/ws": "^8.5.13",
     "tsup": "^8.5.1",

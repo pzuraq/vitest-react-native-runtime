@@ -24,6 +24,12 @@ import type { NativePoolOptions, Platform } from './types';
 
 const DEFAULT_BUNDLE_ID = 'com.vitest.nativetest';
 
+// TypeScript's DOM lib declares setTimeout as returning `number`; Node.js returns
+// a Timeout object with .unref(). Cast through unknown to access it safely.
+function unrefTimer(t: ReturnType<typeof setTimeout>): void {
+  (t as unknown as { unref(): void }).unref();
+}
+
 // Module-level singletons — persist across pool worker recreations (watch cycles)
 let _wss: WebSocketServer | null = null;
 let _connectedSocket: WebSocket | null = null;
@@ -167,7 +173,7 @@ ${entries.join(',\n')}
           reject(new Error('Metro startup timeout (60s)'));
         }
       }, 60000);
-      t.unref();
+      unrefTimer(t);
     });
   }
 
@@ -228,7 +234,7 @@ ${entries.join(',\n')}
           /* ignore */
         }
       }, 2000);
-      t.unref();
+      unrefTimer(t);
       log.verbose('Metro closed');
     }
   }
@@ -287,7 +293,7 @@ ${entries.join(',\n')}
         _wss = null;
         resolvePromise();
       }, 1000);
-      t.unref();
+      unrefTimer(t);
     });
   }
 
@@ -395,7 +401,7 @@ ${entries.join(',\n')}
           const t = setTimeout(() => {
             if (!_connectedSocket) reject(new Error('App did not connect within 30s'));
           }, 30000);
-          t.unref();
+          unrefTimer(t);
           if (_connectedSocket) {
             clearTimeout(t);
             resolvePromise();
@@ -410,7 +416,7 @@ ${entries.join(',\n')}
         _connectedSocket = null;
         const delay = new Promise<void>(r => {
           const t = setTimeout(r, 1000);
-          t.unref();
+          unrefTimer(t);
         });
         await delay;
         await launchWithRetry();

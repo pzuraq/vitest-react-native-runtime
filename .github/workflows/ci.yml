@@ -18,6 +18,7 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      - run: npm run build --workspace=packages/vitest-react-native-runtime
       - run: npm run lint
       - run: npm run check-types
       - run: npm run format:check
@@ -54,6 +55,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build package
+        run: npm run build --workspace=packages/vitest-react-native-runtime
+
       - name: Build test harness app
         working-directory: app
         run: |
@@ -84,17 +88,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build package
+        run: npm run build --workspace=packages/vitest-react-native-runtime
+
       - name: Build test harness app
         working-directory: app
         run: |
           npm install
           npx expo prebuild --platform ios --clean
+          cd ios && pod install && cd ..
           xcodebuild \
-            -workspace ios/vitestnative.xcworkspace \
-            -scheme vitestnative \
+            -workspace ios/vitest-native.xcworkspace \
+            -scheme vitest-native \
             -sdk iphonesimulator \
             -configuration Debug \
             ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
             -derivedDataPath build
 
       - name: Boot simulator
@@ -115,7 +125,7 @@ jobs:
 
       - name: Install app on simulator
         run: |
-          APP_PATH=$(find app/build -name "vitestnative.app" -type d | head -1)
+          APP_PATH=$(find app/build -name "vitest-native.app" -type d | head -1)
           xcrun simctl install "$SIM_ID" "$APP_PATH"
 
       - name: Run E2E tests

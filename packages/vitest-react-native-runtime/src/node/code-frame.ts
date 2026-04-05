@@ -7,8 +7,11 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import pc from 'picocolors';
+import { createColors } from 'picocolors';
 import { highlight } from 'tinyhighlight';
+
+const isColorEnabled = !process.env.CI && !!process.stdout.isTTY;
+const pc = createColors(isColorEnabled);
 
 export const V8_STACK_RE = /at\s+(?:(.+?)\s+\()?(.+?):(\d+):(\d+)\)?/;
 
