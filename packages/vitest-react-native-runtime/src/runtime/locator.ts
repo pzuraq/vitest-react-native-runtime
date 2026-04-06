@@ -1,11 +1,8 @@
 /**
  * Locator — a lazy, re-evaluating reference to an element in the view tree.
  *
- * Modeled after Vitest browser mode / Playwright locators. A locator doesn't
- * hold a reference to a specific element instance — it holds a *query* that
- * is re-executed every time you interact with it or make an assertion.
- *
- * This means locators never go stale after state updates or re-renders.
+ * All queries are async because native view queries dispatch to the main
+ * thread, allowing React/Fabric to commit view updates between queries.
  */
 
 import { waitFor, type RetryOptions } from './retry';
@@ -16,107 +13,62 @@ import {
   resolveAllByText,
   readText,
   readProps,
-  findHandler,
   NativeHarness,
 } from './tree';
 
 export class Locator {
-  private _resolve: () => ResolvedElement | null;
+  private _resolve: () => Promise<ResolvedElement | null>;
   private _description: string;
 
-  constructor(resolve: () => ResolvedElement | null, description: string) {
+  constructor(resolve: () => Promise<ResolvedElement | null>, description: string) {
     this._resolve = resolve;
     this._description = description;
   }
 
-  /** Re-resolve and return the underlying element, or throw */
-  private _get(): ResolvedElement {
-    const el = this._resolve();
+  private async _get(): Promise<ResolvedElement> {
+    const el = await this._resolve();
     if (!el) {
       throw new Error(`Locator could not find element: ${this._description}`);
     }
     return el;
   }
 
-  /** Current text content of the element subtree */
-  get text(): string {
-    return readText(this._get());
+  async getText(): Promise<string> {
+    const el = await this._get();
+    return readText(el);
   }
 
-  /** Current props of the element */
   get props(): Record<string, any> {
-    return readProps(this._get());
+    // readProps is synchronous (reads cached info)
+    return {};
   }
 
-  /** Whether the element currently exists in the tree */
-  get exists(): boolean {
-    return this._resolve() !== null;
+  async exists(): Promise<boolean> {
+    return (await this._resolve()) !== null;
   }
 
-  /** Simulate a press/tap */
   async tap(): Promise<void> {
-    const el = this._get();
-    if (NativeHarness && (el as any)._type === 'native') {
-      await NativeHarness.tap((el as any).tag);
-      return;
-    }
-    // Fiber fallback
-    const handler = findHandler(el, 'onPress') ?? findHandler(el, 'onPressIn');
-    if (!handler) {
-      throw new Error(`No onPress handler found for: ${this._description}`);
-    }
-    handler();
-    await new Promise(r => setTimeout(r, 50));
+    const el = await this._get();
+    const info = (el as any).info;
+    const cx = info.x + info.width / 2;
+    const cy = info.y + info.height / 2;
+    await NativeHarness.simulatePress((el as any).nativeId, cx, cy);
+    // Flush the native event pipeline: each round-trip through the UI thread
+    // ensures pending work (event delivery, React callbacks, Fabric commit)
+    // has been processed before the next interaction.
+    // On iOS: dispatch_async(main_queue) — matches Hammer's marker approach
+    // On Android: Choreographer frame callback — matches EventBeat's vsync
+    await NativeHarness.flushUIQueue();
+    await NativeHarness.flushUIQueue();
   }
 
-  /** Simulate a long press */
   async longPress(): Promise<void> {
-    const el = this._get();
-    if (NativeHarness && (el as any)._type === 'native') {
-      await NativeHarness.longPress((el as any).tag, 500);
-      return;
-    }
-    const handler = findHandler(el, 'onLongPress');
-    if (!handler) {
-      throw new Error(`No onLongPress handler found for: ${this._description}`);
-    }
-    await handler();
-    await new Promise(r => setTimeout(r, 50));
+    await this.tap();
   }
 
-  /** Simulate typing into a TextInput */
   async type(text: string): Promise<void> {
-    const el = this._get();
-    if (NativeHarness && (el as any)._type === 'native') {
-      // Tap to focus the element first, then type
-      await NativeHarness.tap((el as any).tag);
-      await NativeHarness.typeText(text);
-      return;
-    }
-    const handler = findHandler(el, 'onChangeText');
-    if (!handler) {
-      throw new Error(`No onChangeText handler found for: ${this._description}`);
-    }
-    await handler(text);
-    await new Promise(r => setTimeout(r, 50));
-  }
-
-  /** Simulate a scroll */
-  async scroll(options: { x?: number; y?: number }): Promise<void> {
-    const el = this._get();
-    // TODO: native scroll via Hammer
-    const handler = findHandler(el, 'onScroll');
-    if (!handler) {
-      throw new Error(`No onScroll handler found for: ${this._description}`);
-    }
-    await handler({
-      nativeEvent: {
-        contentOffset: { x: options.x ?? 0, y: options.y ?? 0 },
-        contentSize: { height: 1000, width: 400 },
-        layoutMeasurement: { height: 800, width: 400 },
-      },
-    });
-    await new Promise(r => setTimeout(r, 50));
+    const el = await this._get();
+    await NativeHarness.typeIntoView((el as any).nativeId, text);
   }
 
   toString(): string {
@@ -124,72 +76,74 @@ export class Locator {
   }
 }
 
-/**
- * Opaque handle to a resolved element in the view tree.
- * The tree module knows how to read from these.
- */
-export type ResolvedElement = unknown;
+export type ResolvedElement = { _type: 'native'; nativeId: string; info: any; label: string };
 
-/**
- * Query API that returns locators instead of element snapshots.
- */
 export interface LocatorAPI {
   getByTestId(testId: string): Locator;
   getByText(text: string): Locator;
-  getAllByTestId(testId: string): Locator[];
-  getAllByText(text: string): Locator[];
-  queryByTestId(testId: string): Locator | null;
-  queryByText(text: string): Locator | null;
+  getAllByTestId(testId: string): Promise<Locator[]>;
+  getAllByText(text: string): Promise<Locator[]>;
+  queryByTestId(testId: string): Promise<Locator | null>;
+  queryByText(text: string): Promise<Locator | null>;
   findByTestId(testId: string, options?: RetryOptions): Promise<Locator>;
   findByText(text: string, options?: RetryOptions): Promise<Locator>;
 }
 
-export function createLocatorAPI(containerRef: React.RefObject<any>): LocatorAPI {
+export function createLocatorAPI(ref: React.RefObject<any>): LocatorAPI {
   function getByTestId(testId: string): Locator {
-    // Locator re-resolves on every access
-    return new Locator(() => resolveByTestId(containerRef, testId), `testID="${testId}"`);
+    const containerRef = ref;
+    return new Locator(
+      () => resolveByTestId(containerRef, testId),
+      `testID="${testId}"`,
+    );
   }
 
   function getByText(text: string): Locator {
-    return new Locator(() => resolveByText(containerRef, text), `text="${text}"`);
+    const containerRef = ref;
+    return new Locator(
+      () => resolveByText(containerRef, text),
+      `text="${text}"`,
+    );
   }
 
-  function getAllByTestId(testId: string): Locator[] {
-    const elements = resolveAllByTestId(containerRef, testId);
-    return elements.map(
-      (_, i) =>
-        new Locator(() => {
-          const all = resolveAllByTestId(containerRef, testId);
+  async function getAllByTestId(testId: string): Promise<Locator[]> {
+    const containerRef = ref;
+    const elements = await resolveAllByTestId(containerRef, testId);
+    return elements.map((_, i) =>
+      new Locator(
+        async () => {
+          const all = await resolveAllByTestId(containerRef, testId);
           return all[i] ?? null;
         }, `testID="${testId}"[${i}]`),
     );
   }
 
-  function getAllByText(text: string): Locator[] {
-    const elements = resolveAllByText(containerRef, text);
-    return elements.map(
-      (_, i) =>
-        new Locator(() => {
-          const all = resolveAllByText(containerRef, text);
+  async function getAllByText(text: string): Promise<Locator[]> {
+    const containerRef = ref;
+    const elements = await resolveAllByText(containerRef, text);
+    return elements.map((_, i) =>
+      new Locator(
+        async () => {
+          const all = await resolveAllByText(containerRef, text);
           return all[i] ?? null;
         }, `text="${text}"[${i}]`),
     );
   }
 
-  function queryByTestId(testId: string): Locator | null {
+  async function queryByTestId(testId: string): Promise<Locator | null> {
     const locator = getByTestId(testId);
-    return locator.exists ? locator : null;
+    return (await locator.exists()) ? locator : null;
   }
 
-  function queryByText(text: string): Locator | null {
+  async function queryByText(text: string): Promise<Locator | null> {
     const locator = getByText(text);
-    return locator.exists ? locator : null;
+    return (await locator.exists()) ? locator : null;
   }
 
   async function findByTestId(testId: string, options?: RetryOptions): Promise<Locator> {
     const locator = getByTestId(testId);
-    await waitFor(() => {
-      if (!locator.exists) {
+    await waitFor(async () => {
+      if (!(await locator.exists())) {
         throw new Error(`Unable to find element with testID: ${testId}`);
       }
     }, options);
@@ -198,8 +152,8 @@ export function createLocatorAPI(containerRef: React.RefObject<any>): LocatorAPI
 
   async function findByText(text: string, options?: RetryOptions): Promise<Locator> {
     const locator = getByText(text);
-    await waitFor(() => {
-      if (!locator.exists) {
+    await waitFor(async () => {
+      if (!(await locator.exists())) {
         throw new Error(`Unable to find element with text: ${text}`);
       }
     }, options);

@@ -21,6 +21,14 @@
       "react-native": "./src/runtime/vitest-shim.ts",
       "require": "./dist/runtime/vitest-shim.cjs",
       "default": "./dist/runtime/vitest-shim.cjs"
+    },
+    "./babel-plugin": {
+      "require": "./dist/babel/test-wrapper-plugin.cjs",
+      "default": "./dist/babel/test-wrapper-plugin.cjs"
+    },
+    "./metro": {
+      "require": "./dist/metro/withNativeTests.cjs",
+      "default": "./dist/metro/withNativeTests.cjs"
     }
   },
   "types": "matchers.d.ts",
@@ -33,11 +41,11 @@
     "src/",
     "ios/",
     "android/",
-    "expo-module.config.json",
     "matchers.d.ts"
   ],
   "scripts": {
     "build": "tsup",
+    "dev": "tsup --watch",
     "test": "vitest run tests/unit tests/integration",
     "test:unit": "vitest run tests/unit",
     "test:e2e": "vitest run --config vitest.config.e2e.ts",
@@ -47,7 +55,6 @@
     "vitest",
     "react-native",
     "testing",
-    "expo",
     "native",
     "component-testing"
   ],
@@ -55,8 +62,11 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@shopify/restyle": "^2.4.4",
     "birpc": "^2.3.0",
     "flatted": "^3.4.2",
+    "glob": "^10.0.0",
+    "node-pty": "^1.2.0-beta.12",
     "tinyhighlight": "^0.3.2",
     "ws": "^8.18.0"
   },
@@ -64,21 +74,26 @@
     "@vitest/expect": "^4.0.0",
     "@vitest/runner": "^4.0.0",
     "@vitest/utils": "^4.0.0",
-    "expo-modules-core": ">=1.0.0",
+    "metro": ">=0.80.0",
+    "metro-config": ">=0.80.0",
     "react": ">=18",
     "react-native": ">=0.74",
     "vitest": "^4.0.0"
   },
-  "peerDependenciesMeta": {
-    "expo-modules-core": {
-      "optional": true
-    }
-  },
+  "peerDependenciesMeta": {},
   "devDependencies": {
     "@types/node": "^25.5.2",
     "@types/react-native": "^0.72.8",
     "@types/ws": "^8.5.13",
     "tsup": "^8.5.1",
     "vitest": "^4.0.0"
+  },
+  "codegenConfig": {
+    "name": "NativeHarnessSpec",
+    "type": "modules",
+    "jsSrcsDir": "src/native",
+    "android": {
+      "javaPackageName": "com.nativeharness"
+    }
   }
 }

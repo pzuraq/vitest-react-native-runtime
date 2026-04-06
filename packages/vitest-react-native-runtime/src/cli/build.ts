@@ -2,12 +2,13 @@
  * vitest-react-native-runtime build — build the test harness app for a platform.
  *
  * Usage:
- *   npx vitest-react-native-runtime build android [--app-dir ./test-app]
- *   npx vitest-react-native-runtime build ios     [--app-dir ./test-app]
+ *   npx vitest-react-native-runtime build android [--app-dir .]
+ *   npx vitest-react-native-runtime build ios     [--app-dir .]
  */
 
 import { execSync } from 'node:child_process';
 import { resolve } from 'node:path';
+import { globSync } from 'node:fs';
 import type { Platform } from '../node/types';
 
 const args = process.argv.slice(2);
@@ -21,12 +22,26 @@ if (platform !== 'android' && platform !== 'ios') {
 const appDirFlagIdx = args.indexOf('--app-dir');
 const appDir = resolve(
   process.cwd(),
-  appDirFlagIdx !== -1 ? (args[appDirFlagIdx + 1] ?? './test-app') : './test-app',
+  appDirFlagIdx !== -1 ? (args[appDirFlagIdx + 1] ?? '.') : '.',
 );
 
 function run(cmd: string): void {
   console.log(`> ${cmd}\n`);
   execSync(cmd, { cwd: appDir, stdio: 'inherit' });
+}
+
+function findXcworkspace(): string {
+  const matches = globSync('ios/*.xcworkspace', { cwd: appDir });
+  if (matches.length === 0) {
+    console.error('No .xcworkspace found in ios/. Run expo prebuild first.');
+    process.exit(1);
+  }
+  return matches[0];
+}
+
+function schemeFromWorkspace(workspace: string): string {
+  // workspace is like "ios/foo.xcworkspace" → scheme is "foo"
+  return workspace.replace('ios/', '').replace('.xcworkspace', '');
 }
 
 if (platform === 'android') {
@@ -37,8 +52,10 @@ if (platform === 'android') {
   console.log(`\nBuilding iOS app in ${appDir}...\n`);
   run('npx expo prebuild --platform ios --clean');
   run('cd ios && pod install');
+  const workspace = findXcworkspace();
+  const scheme = schemeFromWorkspace(workspace);
   run(
-    'xcodebuild -workspace ios/vitestnative.xcworkspace -scheme vitestnative -sdk iphonesimulator -configuration Debug ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO -derivedDataPath build',
+    `xcodebuild -workspace ${workspace} -scheme ${scheme} -sdk iphonesimulator -configuration Debug ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO -derivedDataPath build`,
   );
 }
 

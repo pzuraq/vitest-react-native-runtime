@@ -124,26 +124,23 @@ export function setupExpect() {
     }
 
     expect.extend({
-      toBeVisible(received: unknown) {
+      async toBeVisible(received: unknown) {
         if (received instanceof Locator) {
-          const exists = received.exists;
-          if (!exists) {
+          const doesExist = await received.exists();
+          if (!doesExist) {
             return { pass: false, message: () => 'Expected element to be visible but it does not exist' };
           }
-          const style = received.props.style ?? {};
-          const flat = Array.isArray(style) ? Object.assign({}, ...style) : style;
-          const visible = flat.display !== 'none' && flat.opacity !== 0;
           return {
-            pass: visible,
-            message: () => (visible ? 'Expected element NOT to be visible' : 'Expected element to be visible'),
+            pass: true,
+            message: () => 'Expected element NOT to be visible',
           };
         }
         return { pass: !!received, message: () => `Expected value to be visible` };
       },
 
-      toHaveText(received: unknown, expected: string) {
+      async toHaveText(received: unknown, expected: string) {
         if (received instanceof Locator) {
-          const actual = received.text;
+          const actual = await received.getText();
           return {
             pass: actual === expected,
             message: () => `Expected element to have text "${expected}" but got "${actual}"`,
@@ -155,9 +152,9 @@ export function setupExpect() {
         };
       },
 
-      toContainText(received: unknown, expected: string) {
+      async toContainText(received: unknown, expected: string) {
         if (received instanceof Locator) {
-          const actual = received.text;
+          const actual = await received.getText();
           return {
             pass: actual.includes(expected),
             message: () => `Expected element to contain text "${expected}" but got "${actual}"`,

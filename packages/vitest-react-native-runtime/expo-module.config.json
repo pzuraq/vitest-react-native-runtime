@@ -1,9 +1,0 @@
-{
-  "platforms": ["ios", "android"],
-  "ios": {
-    "modules": ["NativeHarnessModule"]
-  },
-  "android": {
-    "modules": ["expo.modules.nativeharness.NativeHarnessModule"]
-  }
-}

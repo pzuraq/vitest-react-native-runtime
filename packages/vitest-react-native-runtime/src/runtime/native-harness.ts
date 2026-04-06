@@ -1,33 +1,53 @@
 /**
- * NativeHarness — JS bridge to the native view query + touch synthesis module.
+ * NativeHarness — JS bridge to the native view query + touch synthesis TurboModule.
  *
- * Works on both iOS (UIKit/Hammer) and Android (View hierarchy/MotionEvent).
- * Returns null if the native module is not available (e.g., Expo Go).
+ * All query methods are async (Promise-based) to avoid blocking the JS event loop,
+ * which is critical for allowing React/Fabric to commit view updates.
  */
 
-interface NativeHarnessModule {
-  findByTestId(testId: string): number | null;
-  getText(reactTag: number): string | null;
-  getFrame(reactTag: number): { x: number; y: number; width: number; height: number } | null;
-  isVisible(reactTag: number): boolean;
-  getViewInfo(reactTag: number): {
-    testId: string | null;
-    text: string | null;
-    isVisible: boolean;
-    isEnabled: boolean;
-    frame: { x: number; y: number; width: number; height: number };
-  } | null;
-  tap(reactTag: number): Promise<void>;
-  longPress(reactTag: number, durationMs: number): Promise<void>;
-  typeText(text: string): Promise<void>;
+import { TurboModuleRegistry } from 'react-native';
+
+export interface ViewInfo {
+  nativeId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface ViewTreeNode {
+  type: string;
+  testID?: string;
+  text?: string;
+  children: ViewTreeNode[];
+  visible: boolean;
+  frame: { x: number; y: number; width: number; height: number };
+}
+
+export interface NativeHarnessModule {
+  queryByTestId(testId: string): Promise<ViewInfo | null>;
+  queryAllByTestId(testId: string): Promise<ViewInfo[]>;
+  queryByText(text: string): Promise<ViewInfo | null>;
+  queryAllByText(text: string): Promise<ViewInfo[]>;
+  getText(nativeId: string): Promise<string | null>;
+  isVisible(nativeId: string): Promise<boolean>;
+  dumpViewTree(): Promise<ViewTreeNode | null>;
+  simulatePress(nativeId: string, x: number, y: number): Promise<void>;
+  typeChar(character: string): Promise<void>;
+  typeIntoView(nativeId: string, text: string): Promise<void>;
+  flushUIQueue(): Promise<void>;
 }
 
 let module: NativeHarnessModule | null = null;
 try {
-  const { requireNativeModule } = require('expo-modules-core');
-  module = requireNativeModule('NativeHarness');
+  module = TurboModuleRegistry.getEnforcing<NativeHarnessModule>('NativeHarness');
 } catch {
-  // Native module not available — will fall back to fiber traversal
+  try {
+    const { NativeModules } = require('react-native');
+    module = NativeModules.NativeHarness ?? null;
+  } catch {
+    module = null;
+  }
 }
 
 export default module;

@@ -33,13 +33,15 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
     port: options.port ?? 7878,
     metroPort: options.metroPort ?? 8081,
     platform: options.platform ?? 'android',
-    bundleId: options.bundleId ?? 'com.vitest.nativetest',
-    appDir: options.appDir ? resolve(process.cwd(), options.appDir) : resolve(process.cwd(), 'test-app'),
-    deviceId: options.deviceId,
+    bundleId: options.bundleId,
+    appDir: options.appDir ? resolve(process.cwd(), options.appDir) : process.cwd(),
+    deviceId: options.deviceId ?? options.device,
     skipIfUnavailable: options.skipIfUnavailable ?? false,
     headless: options.headless ?? mode === 'run',
     shutdownEmulator: options.shutdownEmulator ?? mode === 'run',
     verbose: options.verbose ?? false,
+    nativeModules: options.nativeModules,
+    harnessApp: options.harnessApp,
     mode,
   };
 

@@ -1,177 +1,104 @@
 /**
- * Tree — abstraction over the native view tree.
+ * Tree — view tree queries backed by the NativeHarness TurboModule.
  *
- * Uses the NativeHarness Expo module when available (real native queries).
- * Falls back to fiber traversal for development without native builds.
+ * All queries are async (Promise-based) because native calls dispatch
+ * to the main thread, which allows React/Fabric to commit view updates
+ * between queries.
  */
 
 import type { ResolvedElement } from './locator';
 import NativeHarnessModule from './native-harness';
+import type { ViewInfo } from './native-harness';
 
-const NativeHarness: any = NativeHarnessModule;
-
-// ── Native implementation ──────────────────────────────────────────
-
-function nativeResolveByTestId(_containerRef: React.RefObject<any>, testId: string): ResolvedElement | null {
-  const tag = NativeHarness.findByTestId(testId);
-  if (tag == null) return null;
-  return { _type: 'native', tag, testId } as any;
-}
-
-function nativeResolveByText(_containerRef: React.RefObject<any>, text: string): ResolvedElement | null {
-  // No native text-search API — use fiber fallback
-  return fiberResolveByText(_containerRef, text);
-}
-
-function nativeResolveAllByText(containerRef: React.RefObject<any>, text: string): ResolvedElement[] {
-  // No native findAll-by-text API — use fiber fallback
-  return fiberResolveAllByText(containerRef, text);
-}
-
-function nativeResolveAllByTestId(containerRef: React.RefObject<any>, testId: string): ResolvedElement[] {
-  // Native findByTestId only returns first match; use fiber to find all
-  return fiberResolveAllByTestId(containerRef, testId);
-}
-
-function nativeReadText(element: ResolvedElement): string {
-  const el = element as any;
-  if (el._type === 'native') {
-    return NativeHarness.getText(el.tag) ?? '';
-  }
-  return fiberReadText(element);
-}
-
-function nativeReadProps(element: ResolvedElement): Record<string, any> {
-  const el = element as any;
-  if (el._type === 'native') {
-    const info = NativeHarness.getViewInfo(el.tag);
-    return info
-      ? {
-          testID: info.testId,
-          style: {},
-          accessibilityLabel: info.text,
-        }
-      : {};
-  }
-  return fiberReadProps(element);
-}
-
-function nativeFindHandler(_element: ResolvedElement, _propName: string): ((...args: any[]) => any) | undefined {
-  // Native touch dispatch doesn't need handlers — it dispatches real events.
-  // Return a sentinel so the locator knows to use native tap.
-  return undefined;
-}
-
-// ── Fiber fallback implementation ──────────────────────────────────
-
-function getFiber(ref: React.RefObject<any>): any | null {
-  const current = ref.current;
-  if (!current) return null;
-  return (
-    current._internalFiberInstanceHandleDEV ??
-    current._internalInstanceHandle ??
-    current.__internalInstanceHandle ??
-    null
+if (!NativeHarnessModule) {
+  console.warn(
+    '[vitest-react-native-runtime] NativeHarness module not available. ' +
+      'View queries will not work. Make sure the app is built with native modules.',
   );
 }
 
-function walk(fiber: any, visitor: (f: any) => void): void {
-  if (!fiber) return;
-  visitor(fiber);
-  let child = fiber.child;
-  while (child) {
-    walk(child, visitor);
-    child = child.sibling;
-  }
+const NativeHarness: NonNullable<typeof NativeHarnessModule> = NativeHarnessModule!;
+
+function makeNativeElement(info: ViewInfo, label: string): ResolvedElement {
+  return { _type: 'native', nativeId: info.nativeId, info, label } as any;
 }
 
-function fiberProps(fiber: any): Record<string, any> {
-  return fiber?.memoizedProps ?? fiber?.pendingProps ?? {};
+export async function resolveByTestId(_containerRef: React.RefObject<any>, testId: string): Promise<ResolvedElement | null> {
+  const info = await NativeHarness.queryByTestId(testId);
+  if (!info) return null;
+  return makeNativeElement(info, `testID="${testId}"`);
 }
 
-function fiberTextOf(fiber: any): string {
-  const parts: string[] = [];
-  walk(fiber, f => {
-    if (f.tag === 6) {
-      const content = f.memoizedProps ?? f.pendingProps;
-      if (typeof content === 'string') parts.push(content);
-      if (typeof content === 'number') parts.push(String(content));
-    }
-  });
-  return parts.join('');
+export async function resolveAllByTestId(_containerRef: React.RefObject<any>, testId: string): Promise<ResolvedElement[]> {
+  const infos = await NativeHarness.queryAllByTestId(testId);
+  return infos.map((info, i) => makeNativeElement(info, `testID="${testId}"[${i}]`));
 }
 
-function fiberHandlerUp(fiber: any, propName: string): ((...args: any[]) => any) | undefined {
-  let current = fiber;
-  while (current) {
-    const p = current.memoizedProps ?? current.pendingProps;
-    if (p && typeof p[propName] === 'function') return p[propName];
-    current = current.return;
-  }
+export async function resolveByText(_containerRef: React.RefObject<any>, text: string): Promise<ResolvedElement | null> {
+  const info = await NativeHarness.queryByText(text);
+  if (!info) return null;
+  return makeNativeElement(info, `text="${text}"`);
+}
+
+export async function resolveAllByText(_containerRef: React.RefObject<any>, text: string): Promise<ResolvedElement[]> {
+  const infos = await NativeHarness.queryAllByText(text);
+  return infos.map((info, i) => makeNativeElement(info, `text="${text}"[${i}]`));
+}
+
+export async function readText(element: ResolvedElement): Promise<string> {
+  const el = element as any;
+  return (await NativeHarness.getText(el.nativeId)) ?? '';
+}
+
+export function readProps(element: ResolvedElement): Record<string, any> {
+  const el = element as any;
+  const info: ViewInfo = el.info;
+  return {
+    testID: null,
+    style: {},
+    frame: info ? { x: info.x, y: info.y, width: info.width, height: info.height } : {},
+  };
+}
+
+export function findHandler(
+  _element: ResolvedElement,
+  _propName: string,
+): ((...args: any[]) => any) | undefined {
   return undefined;
 }
 
-function fiberResolveByTestId(containerRef: React.RefObject<any>, testId: string): ResolvedElement | null {
-  const root = getFiber(containerRef);
-  if (!root) return null;
-  let found: any = null;
-  walk(root, f => {
-    if (!found && fiberProps(f).testID === testId) found = f;
-  });
-  return found;
+export type { ViewTreeNode } from './native-harness';
+
+export async function getViewTree(): Promise<import('./native-harness').ViewTreeNode | null> {
+  return NativeHarness.dumpViewTree();
 }
 
-function fiberResolveByText(containerRef: React.RefObject<any>, text: string): ResolvedElement | null {
-  const root = getFiber(containerRef);
-  if (!root) return null;
-  let found: any = null;
-  walk(root, f => {
-    if (fiberTextOf(f).includes(text)) found = f;
-  });
-  return found;
+export async function getViewTreeString(options?: { maxDepth?: number }): Promise<string> {
+  const tree = await NativeHarness.dumpViewTree();
+  if (!tree) return '(empty)';
+  return formatTreeNode(tree, 0, options?.maxDepth ?? 20);
 }
 
-function fiberResolveAllByText(containerRef: React.RefObject<any>, text: string): ResolvedElement[] {
-  const root = getFiber(containerRef);
-  if (!root) return [];
-  const matches: any[] = [];
-  walk(root, f => {
-    if (fiberTextOf(f).includes(text)) matches.push(f);
-  });
-  return matches;
+function formatTreeNode(
+  node: import('./native-harness').ViewTreeNode,
+  depth: number,
+  maxDepth: number,
+): string {
+  if (depth > maxDepth) return '';
+  const indent = '  '.repeat(depth);
+  let line = `${indent}${node.type}`;
+  if (node.testID) line += ` (testID="${node.testID}")`;
+  if (node.text) {
+    const displayText = node.text.length > 60 ? node.text.slice(0, 57) + '...' : node.text;
+    line += ` "${displayText}"`;
+  }
+  if (!node.visible) line += ' [hidden]';
+  const lines = [line];
+  for (const child of node.children) {
+    const childStr = formatTreeNode(child, depth + 1, maxDepth);
+    if (childStr) lines.push(childStr);
+  }
+  return lines.join('\n');
 }
 
-function fiberResolveAllByTestId(containerRef: React.RefObject<any>, testId: string): ResolvedElement[] {
-  const root = getFiber(containerRef);
-  if (!root) return [];
-  const matches: any[] = [];
-  walk(root, f => {
-    if (fiberProps(f).testID === testId) matches.push(f);
-  });
-  return matches;
-}
-
-function fiberReadText(element: ResolvedElement): string {
-  return fiberTextOf(element as any);
-}
-
-function fiberReadProps(element: ResolvedElement): Record<string, any> {
-  return fiberProps(element as any);
-}
-
-function fiberFindHandler(element: ResolvedElement, propName: string): ((...args: any[]) => any) | undefined {
-  return fiberHandlerUp(element as any, propName);
-}
-
-// ── Public API (dispatches to native or fiber) ─────────────────────
-
-export const resolveByTestId = NativeHarness ? nativeResolveByTestId : fiberResolveByTestId;
-export const resolveByText = NativeHarness ? nativeResolveByText : fiberResolveByText;
-export const resolveAllByTestId = NativeHarness ? nativeResolveAllByTestId : fiberResolveAllByTestId;
-export const resolveAllByText = NativeHarness ? nativeResolveAllByText : fiberResolveAllByText;
-export const readText = NativeHarness ? nativeReadText : fiberReadText;
-export const readProps = NativeHarness ? nativeReadProps : fiberReadProps;
-export const findHandler = NativeHarness ? nativeFindHandler : fiberFindHandler;
-
-// Expose for the locator's tap() to use native dispatch
 export { NativeHarness };

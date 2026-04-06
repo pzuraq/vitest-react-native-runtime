@@ -2,8 +2,8 @@
  * vitest-react-native-runtime install — boot a device and install the test harness app.
  *
  * Usage:
- *   npx vitest-react-native-runtime install android [--app-dir ./test-app]
- *   npx vitest-react-native-runtime install ios     [--app-dir ./test-app]
+ *   npx vitest-react-native-runtime install android [--app-dir .]
+ *   npx vitest-react-native-runtime install ios     [--app-dir .]
  */
 
 import { execSync } from 'node:child_process';
@@ -22,7 +22,7 @@ if (platform !== 'android' && platform !== 'ios') {
 const appDirFlagIdx = args.indexOf('--app-dir');
 const appDir = resolve(
   process.cwd(),
-  appDirFlagIdx !== -1 ? (args[appDirFlagIdx + 1] ?? './test-app') : './test-app',
+  appDirFlagIdx !== -1 ? (args[appDirFlagIdx + 1] ?? '.') : '.',
 );
 
 function run(cmd: string): string {

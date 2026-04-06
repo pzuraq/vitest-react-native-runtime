@@ -3,7 +3,9 @@
  */
 
 import { execSync, spawn, type ExecSyncOptions } from 'node:child_process';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { homedir } from 'node:os';
 import { log } from './logger';
 import type { DeviceOptions, Platform } from './types';
 
@@ -12,6 +14,14 @@ interface SimctlDeviceEntry {
   state?: string;
   isAvailable?: boolean;
   udid?: string;
+  name?: string;
+}
+
+/** Info about a booted simulator. */
+export interface SimulatorInfo {
+  udid: string;
+  name: string;
+  runtime: string;
 }
 
 /** Root of simctl `list devices` JSON. */
@@ -70,7 +80,7 @@ let poolBootedEmulator = false;
 
 // ── Android ──────────────────────────────────────────────────────
 
-function isAndroidDeviceOnline(): boolean {
+export function isAndroidDeviceOnline(): boolean {
   const output = run('adb devices');
   if (!output) return false;
   const lines = output.split('\n').slice(1);
@@ -135,12 +145,14 @@ function setupAndroidPorts(wsPort: number, metroPort: number): void {
   }
 }
 
-function launchAndroidApp(bundleId: string, metroPort: number): void {
+function launchAndroidApp(bundleId: string, _metroPort: number): void {
   log.verbose(`Launching ${bundleId}...`);
   run(`adb shell am force-stop ${bundleId}`);
   run('sleep 1');
+  // Use LAUNCHER category to let Android resolve the main activity —
+  // the activity class name may differ from the applicationId.
   execSync(
-    `adb shell am start -n ${bundleId}/.MainActivity -a android.intent.action.MAIN --es "EXDevClientUrl" "http://127.0.0.1:${metroPort}"`,
+    `adb shell monkey -p ${bundleId} -c android.intent.category.LAUNCHER 1`,
     { encoding: 'utf8', stdio: 'pipe' },
   );
   log.verbose('App launched');
@@ -167,14 +179,25 @@ function shutdownAndroidEmulator(): void {
 
 // ── iOS ──────────────────────────────────────────────────────────
 
-function getBootedSimulator(): string | null {
+export function getBootedSimulator(): string | null {
+  const info = getBootedSimulatorInfo();
+  return info?.udid ?? null;
+}
+
+export function getBootedSimulatorInfo(): SimulatorInfo | null {
   const json = run('xcrun simctl list devices booted -j');
   if (!json) return null;
   const devices = parseSimctlDevicesJson(json);
   if (!devices) return null;
-  for (const runtime of Object.values(devices.devices)) {
-    for (const device of runtime) {
-      if (device.state === 'Booted' && device.udid) return device.udid;
+  for (const [runtime, deviceList] of Object.entries(devices.devices)) {
+    for (const device of deviceList) {
+      if (device.state === 'Booted' && device.udid) {
+        return {
+          udid: device.udid,
+          name: device.name ?? 'Unknown',
+          runtime: runtime.replace('com.apple.CoreSimulator.SimRuntime.', '').replace(/-/g, '.'),
+        };
+      }
     }
   }
   return null;
@@ -214,6 +237,44 @@ async function bootIOSSimulator(deviceId?: string): Promise<string> {
   throw new Error('iOS simulator did not boot in time');
 }
 
+/**
+ * Pre-approve a URI scheme for the simulator so `simctl openurl` doesn't show
+ * the "Open in <app>?" confirmation dialog.
+ *
+ * This is the same mechanism Expo CLI uses when pressing `i` in `expo start`.
+ * It writes to the simulator's scheme approval plist directly.
+ */
+function approveSimulatorScheme(simId: string, scheme: string, bundleId: string): void {
+  const plistPath = join(
+    homedir(),
+    'Library/Developer/CoreSimulator/Devices',
+    simId,
+    'data/Library/Preferences/com.apple.launchservices.schemeapproval.plist',
+  );
+
+  // The plist maps "CoreSimulatorBridge--><scheme>" -> "<bundleId>"
+  // We write a minimal binary plist. For simplicity, use plutil to convert.
+  const key = `com.apple.CoreSimulator.CoreSimulatorBridge-->${scheme}`;
+  try {
+    // Read existing plist (if any) as JSON, add our entry, write back
+    let plistData: Record<string, string> = {};
+    if (existsSync(plistPath)) {
+      const json = execSync(`plutil -convert json -o - "${plistPath}"`, { encoding: 'utf8', stdio: 'pipe' });
+      plistData = JSON.parse(json);
+    }
+    plistData[key] = bundleId;
+
+    // Write as XML plist then convert to binary
+    const tmpPath = plistPath + '.tmp.json';
+    writeFileSync(tmpPath, JSON.stringify(plistData));
+    execSync(`plutil -convert binary1 "${tmpPath}" -o "${plistPath}"`, { stdio: 'pipe' });
+    execSync(`rm -f "${tmpPath}"`, { stdio: 'pipe' });
+    log.verbose(`Approved scheme "${scheme}" for ${bundleId} on simulator`);
+  } catch (e: unknown) {
+    log.verbose(`Could not update scheme approval (non-fatal): ${errorMessage(e)}`);
+  }
+}
+
 function launchIOSApp(bundleId: string, metroPort: number, deviceId?: string): void {
   const simId = deviceId || getBootedSimulator();
   if (!simId) {
@@ -222,9 +283,17 @@ function launchIOSApp(bundleId: string, metroPort: number, deviceId?: string): v
   }
   log.verbose(`Launching ${bundleId} on ${simId}...`);
   run(`xcrun simctl terminate ${simId} ${bundleId}`);
+
+  // Set RCTBundleURLProvider defaults so the app finds Metro.
+  // jsLocation is just the host — RCTBundleURLProvider adds the port separately.
+  run(`xcrun simctl spawn ${simId} defaults write ${bundleId} RCT_jsLocation "127.0.0.1"`);
+  if (metroPort !== 8081) {
+    run(`xcrun simctl spawn ${simId} defaults write ${bundleId} RCT_packagerPort -string "${metroPort}"`);
+  }
+
   try {
     execSync(
-      `xcrun simctl launch --terminate-running-process ${simId} ${bundleId} "EXDevClientUrl=http://127.0.0.1:${metroPort}"`,
+      `xcrun simctl launch ${simId} ${bundleId}`,
       { encoding: 'utf8', stdio: 'pipe' },
     );
     log.verbose('App launched');

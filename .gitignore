@@ -13,5 +13,18 @@ npm-debug.log*
 .env.local
 .env.*.local
 
+*.local.json
+
 # Pack artifacts
 *.tgz
+
+# Expo
+.expo/
+
+# Build artifacts
+test-app/ios/
+test-app/android/
+test-app/build/
+
+# vitest-react-native-runtime
+.vitest-native/

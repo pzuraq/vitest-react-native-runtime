@@ -11,6 +11,43 @@ import { symbolicateStack } from './symbolicate';
 let ws: WebSocket | null = null;
 let vitestRpc: any = null;
 let storedConfig: any = null;
+let _poolMode: 'dev' | 'run' = 'dev';
+
+/** Check if we have an active WebSocket connection to the Vitest pool. */
+export function isConnected(): boolean {
+  return ws !== null && ws.readyState === WebSocket.OPEN;
+}
+
+// ── Screenshot request/response ──────────────────────────────────
+
+const pendingScreenshots = new Map<
+  string,
+  { resolve: (filePath: string) => void; reject: (err: Error) => void }
+>();
+
+export function requestScreenshot(name?: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      reject(new Error('Not connected to Vitest pool. Cannot take screenshot.'));
+      return;
+    }
+    const requestId = `ss-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    pendingScreenshots.set(requestId, { resolve, reject });
+    ws.send(JSON.stringify({ __screenshot_request__: true, requestId, name }));
+    setTimeout(() => {
+      if (pendingScreenshots.has(requestId)) {
+        pendingScreenshots.delete(requestId);
+        reject(new Error('Screenshot request timed out (10s)'));
+      }
+    }, 10000);
+  });
+}
+
+// ── Pause/resume infrastructure ──────────────────────────────────
+
+import { configurePause, resume as resumePause, resetPause } from './pause';
+
+let _runAbortController: AbortController | null = null;
 
 // Serial task queue — ensures only one run/collect executes at a time
 let _taskQueue: Promise<void> = Promise.resolve();
@@ -18,38 +55,11 @@ function enqueue(fn: () => Promise<void>): void {
   _taskQueue = _taskQueue.then(fn, fn);
 }
 
-// ── Status event system for UI ────────────────────────────────────
+// ── Status (re-exported from state.ts to avoid circular dep) ─────
 
-type StatusListener = (status: HarnessStatus) => void;
-const statusListeners: Set<StatusListener> = new Set();
-
-export interface HarnessStatus {
-  state: 'connecting' | 'connected' | 'running' | 'done' | 'error';
-  message: string;
-  passed?: number;
-  failed?: number;
-  total?: number;
-  logs?: string[];
-}
-
-let currentStatus: HarnessStatus = { state: 'connecting', message: 'Connecting to Vitest...' };
-const logs: string[] = [];
-
-function setStatus(status: Partial<HarnessStatus>) {
-  currentStatus = { ...currentStatus, ...status };
-  statusListeners.forEach(fn => fn(currentStatus));
-}
-
-function addLog(line: string) {
-  logs.push(line);
-  setStatus({ logs: [...logs] });
-}
-
-export function onStatusChange(listener: StatusListener): () => void {
-  statusListeners.add(listener);
-  listener(currentStatus);
-  return () => statusListeners.delete(listener);
-}
+import { setStatus, addLog, resetLogs, onStatusChange } from './state';
+export { setStatus, onStatusChange };
+export type { HarnessStatus } from './state';
 
 // ── WebSocket transport ───────────────────────────────────────────
 
@@ -67,14 +77,48 @@ function sendResponse(response: any) {
 
 let passed = 0;
 let failed = 0;
+let fileIndex = 0;
+let fileCount = 0;
 
-async function handleRun(context: any) {
-  const files = context.files;
-  const fileCount = files?.length ?? 0;
-  setStatus({ state: 'running', message: `Running ${fileCount} test file(s)...` });
+function resetRunState() {
   passed = 0;
   failed = 0;
-  logs.length = 0;
+  fileIndex = 0;
+  fileCount = 0;
+  resetLogs();
+}
+
+async function handleRun(context: any) {
+  // Set up abort controller for this run (used by pause() to detect cancellation)
+  _runAbortController = new AbortController();
+  const notifyPool = (msg: any) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(msg));
+    }
+  };
+  configurePause({ notifyPool, abortSignal: _runAbortController.signal, mode: _poolMode });
+
+  const files = context.files;
+  fileIndex++;
+
+  // Extract a short filename for the UI
+  const filePath: string = files?.[0]?.filepath ?? '';
+  const fileName = filePath.split('/').pop() ?? filePath;
+  // Derive the module/suite name from the path (e.g. modules/counter/tests/counter.test.tsx → counter)
+  const parts = filePath.split('/');
+  const modulesIdx = parts.indexOf('modules');
+  const moduleName = modulesIdx >= 0 ? parts[modulesIdx + 1] : fileName;
+
+  setStatus({
+    state: 'running',
+    message: `[${fileIndex}/${fileCount}] ${moduleName}`,
+    currentFile: fileName,
+    fileIndex,
+    fileCount,
+  });
+
+  // Yield to let React render the updated progress before tests block the thread
+  await new Promise(r => setTimeout(r, 0));
 
   try {
     const config = storedConfig ??
@@ -98,7 +142,6 @@ async function handleRun(context: any) {
       };
 
     const runner = new ReactNativeRunner(config, vitestRpc, test => {
-      // Callback for each test completion — update UI
       const name = test.name ?? '?';
       const state = test.result?.state ?? 'unknown';
       const duration = test.result?.duration ?? 0;
@@ -110,31 +153,47 @@ async function handleRun(context: any) {
         const errMsg = test.result?.errors?.[0]?.message ?? 'unknown error';
         addLog(`✗ ${name} (${duration}ms)\n  ${errMsg}`);
       }
-      setStatus({ passed, failed, total: passed + failed });
+      setStatus({
+        passed,
+        failed,
+        total: passed + failed,
+        message: `[${fileIndex}/${fileCount}] ${moduleName} — ${passed + failed} tests`,
+      });
     });
 
     await startTests(files ?? [], runner);
   } catch (err: any) {
-    console.error('[vitest-react-native-runtime] Run error:', err);
-    addLog(`ERROR: ${err?.message}`);
-    setStatus({ state: 'error', message: err?.message ?? 'Unknown error' });
-    try {
-      const stack = err?.stack ? await symbolicateStack(err.stack) : err?.stack;
-      vitestRpc?.onUnhandledError({ message: err?.message, stack, name: err?.name }, 'Unhandled Error');
-    } catch {
-      /* ignore symbolication errors */
+    // AbortError means a new run is starting — don't report as failure
+    if (err?.name === 'AbortError') {
+      console.log('[vitest-react-native-runtime] Run aborted (new run starting)');
+    } else {
+      console.error('[vitest-react-native-runtime] Run error:', err);
+      addLog(`ERROR: ${err?.message}`);
+      setStatus({ state: 'error', message: err?.message ?? 'Unknown error' });
+      try {
+        const stack = err?.stack ? await symbolicateStack(err.stack) : err?.stack;
+        vitestRpc?.onUnhandledError({ message: err?.message, stack, name: err?.name }, 'Unhandled Error');
+      } catch {
+        /* ignore symbolication errors */
+      }
     }
+  } finally {
+    resetPause();
+    _runAbortController = null;
   }
 
-  setStatus({
-    state: 'done',
-    message: `Done: ${passed} passed, ${failed} failed`,
-    passed,
-    failed,
-    total: passed + failed,
-  });
+  // Show done state only after the last file
+  if (fileIndex >= fileCount) {
+    setStatus({
+      state: 'done',
+      message: `Done: ${passed} passed${failed > 0 ? `, ${failed} failed` : ''}`,
+      passed,
+      failed,
+      total: passed + failed,
+    });
+  }
 
-  await new Promise(r => setTimeout(r, 500));
+  await new Promise(r => setTimeout(r, 100));
   sendResponse({ type: 'testfileFinished' });
 }
 
@@ -223,11 +282,35 @@ export function connectToVitest(options: ConnectOptions = {}) {
       const raw = typeof event.data === 'string' ? event.data : String(event.data);
       try {
         // Messages from the pool are flatted-encoded
-        let msg;
+        let msg: any;
         try {
           msg = flatParse(raw);
         } catch {
           msg = JSON.parse(raw);
+        }
+        // Screenshot response from pool
+        if (msg.__screenshot_response__) {
+          const pending = pendingScreenshots.get(msg.requestId);
+          if (pending) {
+            pendingScreenshots.delete(msg.requestId);
+            if (msg.error) {
+              pending.reject(new Error(msg.error));
+            } else {
+              pending.resolve(msg.filePath);
+            }
+          }
+          return;
+        }
+        // Resume signal from pool
+        if (msg.__resume) {
+          resumePause();
+          return;
+        }
+        if (msg.__native_run_start) {
+          resetRunState();
+          fileCount = msg.fileCount ?? 0;
+          setStatus({ state: 'running', message: `Running ${fileCount} test file(s)...` });
+          return;
         }
         if (msg.__vitest_worker_request__) {
           switch (msg.type) {
@@ -235,15 +318,25 @@ export function connectToVitest(options: ConnectOptions = {}) {
               if (msg.context?.config) {
                 storedConfig = msg.context.config;
               }
+              if (msg.context?.config?.__poolMode) {
+                _poolMode = msg.context.config.__poolMode;
+              }
               sendResponse({ type: 'started' });
               break;
             case 'run':
+              // Abort any paused/running test so the new run can start
+              if (_runAbortController) {
+                _runAbortController.abort(new DOMException('New test run starting', 'AbortError'));
+              }
               enqueue(() => handleRun(msg.context));
               break;
             case 'collect':
               enqueue(() => handleCollect(msg.context));
               break;
             case 'cancel':
+              if (_runAbortController) {
+                _runAbortController.abort(new DOMException('Cancelled', 'AbortError'));
+              }
               break;
             case 'stop':
               sendResponse({ type: 'stopped' });

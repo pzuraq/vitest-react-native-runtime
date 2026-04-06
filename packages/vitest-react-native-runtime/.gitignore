@@ -18,3 +18,5 @@ binary/ios/
 
 # Pack artifacts
 *.tgz
+
+*.local.json
