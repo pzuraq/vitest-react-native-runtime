@@ -34,9 +34,10 @@
   "types": "matchers.d.ts",
   "main": "dist/node/index.cjs",
   "bin": {
-    "vitest-mobile": "./dist/cli/index.js"
+    "vitest-mobile": "./bin/vitest-mobile.mjs"
   },
   "files": [
+    "bin/",
     "dist/",
     "src/",
     "ios/",

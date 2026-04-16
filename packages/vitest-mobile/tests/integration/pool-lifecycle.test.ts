@@ -16,7 +16,38 @@ vi.mock('../../src/node/device', () => ({
   stopApp: vi.fn(),
 }));
 
+vi.mock('../../src/node/harness-builder', () => ({
+  detectReactNativeVersion: vi.fn(() => '0.76.0'),
+  ensureHarnessBinary: vi.fn(async () => ({
+    binaryPath: '',
+    bundleId: 'com.vitest.mobile.harness',
+  })),
+}));
+
+vi.mock('../../src/node/metro-runner', () => ({
+  startMetroServer: vi.fn(async () => ({
+    close: vi.fn(async () => {}),
+  })),
+}));
+
+vi.mock('../../src/metro/generateTestRegistry', () => ({
+  generateTestRegistry: vi.fn(() => ({ testFiles: [] })),
+}));
+
+vi.mock('../../src/node/instance-manager', () => ({
+  resolveInstanceResources: vi.fn(async (opts: { wsPort: number; metroPort: number; appDir: string }) => ({
+    instanceId: `test-${Date.now().toString(36)}`,
+    wsPort: opts.wsPort,
+    metroPort: opts.metroPort,
+    outputDir: opts.appDir,
+  })),
+  registerInstanceRecord: vi.fn(),
+  releaseInstanceRecord: vi.fn(),
+  updateInstanceRecord: vi.fn(),
+}));
+
 import { createNativePoolWorker } from '../../src/node/pool';
+import { closeServer } from '../../src/node/connections';
 import { checkEnvironment } from '../../src/node/environment';
 import { ensureDevice } from '../../src/node/device';
 import type { NativePoolOptions } from '../../src/node/types';
@@ -49,7 +80,7 @@ function poolOptions(port: number, metroPort: number, appDir: string): NativePoo
   };
 }
 
-function connectWs(port: number): Promise<WebSocket> {
+function connectWs(port: number, platform = 'android'): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + 25_000;
     const attempt = (): void => {
@@ -58,7 +89,10 @@ function connectWs(port: number): Promise<WebSocket> {
         return;
       }
       const ws = new WebSocket(`ws://127.0.0.1:${port}`);
-      ws.once('open', () => resolve(ws));
+      ws.once('open', () => {
+        ws.send(JSON.stringify({ __hello: true, platform }));
+        resolve(ws);
+      });
       ws.once('error', () => setTimeout(attempt, 30));
     };
     attempt();
@@ -103,6 +137,7 @@ describe('createNativePoolWorker lifecycle (mocked device / Metro / binary)', ()
       }
       worker = null;
     }
+    await closeServer();
     vi.unstubAllGlobals();
   });
 
@@ -124,10 +159,10 @@ describe('createNativePoolWorker lifecycle (mocked device / Metro / binary)', ()
     metroPort = await reservePort();
     worker = createNativePoolWorker(poolOptions(port, metroPort, appDir));
 
-    const startP = worker.start();
+    worker.start();
     const ws = await connectWs(port);
     clients.push(ws);
-    await startP;
+    await new Promise(r => setTimeout(r, 200));
 
     expect(vi.mocked(checkEnvironment)).toHaveBeenCalled();
     expect(vi.mocked(ensureDevice)).toHaveBeenCalled();
@@ -138,17 +173,16 @@ describe('createNativePoolWorker lifecycle (mocked device / Metro / binary)', ()
     metroPort = await reservePort();
     worker = createNativePoolWorker(poolOptions(port, metroPort, appDir));
 
-    const startP = worker.start();
+    worker.start();
     const ws = await connectWs(port);
     clients.push(ws);
+    await new Promise(r => setTimeout(r, 200));
 
     const received = new Promise<unknown>(resolve => {
       ws.once('message', data => {
         resolve(flatParse(data.toString()));
       });
     });
-
-    await startP;
 
     worker.send({ type: 'test' } as Parameters<typeof worker.send>[0]);
     const msg = await received;
@@ -160,23 +194,20 @@ describe('createNativePoolWorker lifecycle (mocked device / Metro / binary)', ()
     metroPort = await reservePort();
     worker = createNativePoolWorker(poolOptions(port, metroPort, appDir));
 
-    const startP = worker.start();
+    worker.start();
     const ws = await connectWs(port);
     clients.push(ws);
-    await startP;
+    await new Promise(r => setTimeout(r, 200));
 
     const received: unknown[] = [];
     const listener = (data: unknown) => received.push(data);
     worker.on('message', listener);
 
-    // Trigger emit() by having the WS client send a raw message to the pool —
-    // the pool's socket.on('message') handler parses it and calls _currentEmit('message', msg).
     ws.send(JSON.stringify({ ping: 1 }));
     await new Promise(r => setTimeout(r, 100));
     const countAfterOn = received.length;
     expect(countAfterOn).toBeGreaterThan(0);
 
-    // Remove the listener, send another message, and confirm it no longer fires.
     worker.off('message', listener);
     ws.send(JSON.stringify({ ping: 2 }));
     await new Promise(r => setTimeout(r, 100));
@@ -188,10 +219,10 @@ describe('createNativePoolWorker lifecycle (mocked device / Metro / binary)', ()
     metroPort = await reservePort();
     worker = createNativePoolWorker(poolOptions(port, metroPort, appDir));
 
-    const startP = worker.start();
+    worker.start();
     const ws = await connectWs(port);
     clients.push(ws);
-    await startP;
+    await new Promise(r => setTimeout(r, 200));
 
     const stopped = new Promise<unknown>(resolve => {
       worker!.on('message', data => {

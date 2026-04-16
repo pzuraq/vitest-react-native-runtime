@@ -78,7 +78,7 @@ export class Locator {
       return resolved;
     });
     const { info } = el;
-    if (info && Harness.simulatePress) {
+    if (info && Harness?.simulatePress) {
       const cx = info.x + info.width / 2;
       const cy = info.y + info.height / 2;
       await Harness.simulatePress(el.nativeId, cx, cy);
@@ -109,7 +109,7 @@ export class Locator {
       if (!resolved) throw new Error(`Locator could not find element: ${this._description}`);
       return resolved;
     });
-    if (el.nativeId && Harness.typeIntoView) {
+    if (el.nativeId && Harness?.typeIntoView) {
       await Harness.typeIntoView(el.nativeId, text);
     } else {
       const handler = findHandler(el, 'onChangeText');

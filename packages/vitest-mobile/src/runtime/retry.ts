@@ -24,7 +24,7 @@ export function yieldToEventLoop(): Promise<void> {
 }
 
 export async function waitFor<T>(fn: () => T | Promise<T>, options: RetryOptions = {}): Promise<T> {
-  const { timeout = DEFAULT_TIMEOUT } = options;
+  const { timeout = DEFAULT_TIMEOUT, interval = DEFAULT_INTERVAL } = options;
   const deadline = Date.now() + timeout;
   let lastError: unknown;
   let attempts = 0;
@@ -42,6 +42,9 @@ export async function waitFor<T>(fn: () => T | Promise<T>, options: RetryOptions
     // Extra yield every few attempts to ensure Fabric has time to commit
     if (attempts % 5 === 0) {
       await yieldToEventLoop();
+    }
+    if (interval > 0) {
+      await new Promise(r => setTimeout(r, interval));
     }
   }
 
