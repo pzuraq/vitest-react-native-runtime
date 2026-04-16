@@ -13,6 +13,8 @@ import {
   type LayoutChangeEvent,
   type ViewStyle,
 } from 'react-native';
+import { useTheme } from '@shopify/restyle';
+import type { Theme } from './theme';
 
 export interface SimpleBottomSheetRef {
   snapToIndex: (index: number) => void;
@@ -21,17 +23,11 @@ export interface SimpleBottomSheetRef {
 }
 
 interface SimpleBottomSheetProps {
-  /** Snap points as pixel values or percentage strings (e.g. ['45%', '90%']). */
   snapPoints: (number | string)[];
-  /** Enable dynamic sizing from the first child (peek content). */
   enableDynamicSizing?: boolean;
-  /** Max height for dynamic content measurement. */
   maxDynamicContentSize?: number;
-  /** Initial snap index (-1 = dynamic/peek). */
   index?: number;
-  /** Style for the sheet background. */
   backgroundStyle?: ViewStyle;
-  /** Style for the drag handle indicator. */
   handleIndicatorStyle?: ViewStyle;
   children: React.ReactNode;
 }
@@ -59,6 +55,8 @@ export const SimpleBottomSheet = React.forwardRef<SimpleBottomSheetRef, SimpleBo
     },
     ref,
   ) {
+    const { colors } = useTheme<Theme>();
+    const styles = useMemo(() => createStyles(colors), [colors]);
     const resolvedSnaps = useMemo(() => snapPoints.map(resolveSnapPoint).sort((a, b) => a - b), [snapPoints]);
 
     const [peekHeight, setPeekHeight] = useState(80);
@@ -73,7 +71,6 @@ export const SimpleBottomSheet = React.forwardRef<SimpleBottomSheetRef, SimpleBo
     const currentHeight = useRef(allSnaps[0] ?? 80);
     const dragStart = useRef(0);
 
-    // Keep currentHeight in sync with animated value
     useEffect(() => {
       const id = sheetHeight.addListener(({ value }) => {
         currentHeight.current = value;
@@ -112,7 +109,6 @@ export const SimpleBottomSheet = React.forwardRef<SimpleBottomSheetRef, SimpleBo
       [snapToIndex, snapTo, sheetHeight],
     );
 
-    // Snap to initial position when snaps change
     useEffect(() => {
       const idx = index === -1 ? 0 : Math.min(index, allSnaps.length - 1);
       currentSnapIdx.current = idx;
@@ -176,7 +172,6 @@ export const SimpleBottomSheet = React.forwardRef<SimpleBottomSheetRef, SimpleBo
 
     return (
       <Animated.View style={[styles.sheet, backgroundStyle, { height: sheetHeight }]}>
-        {/* Drag zone: handle + peek content */}
         <View {...panResponder.panHandlers}>
           <View style={styles.handleContainer}>
             <View style={[styles.handleIndicator, handleIndicatorStyle]} />
@@ -184,46 +179,45 @@ export const SimpleBottomSheet = React.forwardRef<SimpleBottomSheetRef, SimpleBo
           <View onLayout={onPeekLayout}>{peekChild}</View>
         </View>
 
-        {/* Scrollable content */}
         <View style={styles.contentContainer}>{restChildren}</View>
 
-        {/* Bottom padding for home indicator */}
         <View style={{ height: 34 }} />
       </Animated.View>
     );
   },
 );
 
-const styles = StyleSheet.create({
-  sheet: {
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: '#1e293b',
-    borderTopLeftRadius: 12,
-    borderTopRightRadius: 12,
-    overflow: 'hidden',
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: 'rgba(148,163,184,0.3)',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -6 },
-    shadowOpacity: 0.6,
-    shadowRadius: 20,
-    elevation: 24,
-  },
-  handleContainer: {
-    alignItems: 'center',
-    paddingVertical: 8,
-  },
-  handleIndicator: {
-    width: 36,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: '#64748b',
-  },
-  contentContainer: {
-    flex: 1,
-    overflow: 'hidden',
-  },
-});
+const createStyles = (colors: Theme['colors']) =>
+  StyleSheet.create({
+    sheet: {
+      position: 'absolute',
+      bottom: 0,
+      left: 0,
+      right: 0,
+      backgroundColor: colors.surface,
+      borderTopLeftRadius: 12,
+      borderTopRightRadius: 12,
+      overflow: 'hidden',
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: 'rgba(148,163,184,0.3)',
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: -6 },
+      shadowOpacity: 0.6,
+      shadowRadius: 20,
+      elevation: 24,
+    },
+    handleContainer: {
+      alignItems: 'center',
+      paddingVertical: 8,
+    },
+    handleIndicator: {
+      width: 36,
+      height: 4,
+      borderRadius: 2,
+      backgroundColor: colors.textDim,
+    },
+    contentContainer: {
+      flex: 1,
+      overflow: 'hidden',
+    },
+  });

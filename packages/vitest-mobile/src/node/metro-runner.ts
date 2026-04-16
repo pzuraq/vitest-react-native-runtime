@@ -11,7 +11,7 @@ import { createRequire } from 'node:module';
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { log } from './logger';
 import { generateTestRegistry } from '../metro/generateTestRegistry';
-import { runServer, type RunServerOptions, type RunServerResult, type Reporter } from 'metro';
+import { runServer, runBuild, type RunServerOptions, type RunServerResult, type Reporter } from 'metro';
 import { loadConfig, type ConfigT, type Middleware } from 'metro-config';
 import type { CustomResolutionContext, CustomResolver } from 'metro-resolver';
 import type connect from 'connect';
@@ -80,21 +80,25 @@ function createDevMiddlewareLogger() {
   };
 }
 
-// ── Public API ─────────────────────────────────────────────────────
+// ── Shared Config Preparation ──────────────────────────────────────
 
-export async function startMetroServer(options: MetroRunnerOptions): Promise<MetroServer> {
-  const { projectRoot, port, wsPort, testPatterns, appModuleName, platform } = options;
+export interface PreparedMetroConfig {
+  config: ConfigT;
+  entryPath: string;
+  outputDir: string;
+  registryPath: string;
+  testFiles: string[];
+}
 
-  // Ensure .vitest-mobile dir exists
+export async function prepareMetroConfig(options: MetroRunnerOptions): Promise<PreparedMetroConfig> {
+  const { projectRoot, port, wsPort, testPatterns, appModuleName } = options;
+
   const outputDir = options.outputDir ?? resolve(projectRoot, '.vitest-mobile');
   mkdirSync(outputDir, { recursive: true });
   if (!existsSync(resolve(outputDir, '.gitignore'))) {
     writeFileSync(resolve(outputDir, '.gitignore'), '*\n');
   }
 
-  // 1. Generate entry point + babel config + test registry
-  // Write entry points for both platforms so a single Metro instance can serve
-  // iOS and Android (the JS content is identical, only the filename differs).
   for (const plat of ['ios', 'android'] as const) {
     generateEntryPoint({
       entryPath: resolve(outputDir, `index.${plat}.js`),
@@ -112,16 +116,21 @@ export async function startMetroServer(options: MetroRunnerOptions): Promise<Met
   });
   log.info(`Discovered ${testFiles.length} test file(s)`);
 
-  // 2. Load Metro config (user's or generated default)
   const baseConfig = await loadMetroConfig(projectRoot, outputDir);
-
-  // 3. Apply test-specific transforms
   const config = applyTestTransforms(baseConfig, { projectRoot, port, registryPath, outputDir });
+  const entryPath = resolve(outputDir, `index.${options.platform}.js`);
 
-  // 4. Set up dev middleware (inspector proxy, /open-debugger)
+  return { config, entryPath, outputDir, registryPath, testFiles };
+}
+
+// ── Public API ─────────────────────────────────────────────────────
+
+export async function startMetroServer(options: MetroRunnerOptions): Promise<MetroServer> {
+  const { config, outputDir } = await prepareMetroConfig(options);
+  const { projectRoot, port } = options;
+
   const { middleware: devMiddleware, websocketEndpoints } = loadDevMiddleware(projectRoot, port);
 
-  // 5. Start Metro
   log.info(`Starting Metro on port ${port}...`);
 
   const runServerOpts: RunServerOptions = {
@@ -143,6 +152,73 @@ export async function startMetroServer(options: MetroRunnerOptions): Promise<Met
       log.verbose('Metro server closed');
     },
   };
+}
+
+// ── Offline Bundle Build ──────────────────────────────────────────
+
+export interface BundleManifest {
+  wsPort: number;
+  metroPort: number;
+  dev: boolean;
+  bundles: Record<string, { bundleFile: string; sourcemapFile: string }>;
+}
+
+export interface BuildBundleOptions {
+  projectRoot: string;
+  outDir: string;
+  platforms: ('ios' | 'android')[];
+  wsPort: number;
+  metroPort: number;
+  testPatterns: string[];
+  dev?: boolean;
+}
+
+export async function buildBundle(options: BuildBundleOptions): Promise<BundleManifest> {
+  const { projectRoot, outDir, platforms, wsPort, metroPort, testPatterns, dev = true } = options;
+
+  mkdirSync(outDir, { recursive: true });
+
+  const manifest: BundleManifest = { wsPort, metroPort, dev, bundles: {} };
+
+  for (const platform of platforms) {
+    log.info(`Bundling for ${platform}...`);
+
+    const prepared = await prepareMetroConfig({
+      projectRoot,
+      port: metroPort,
+      wsPort,
+      platform,
+      testPatterns,
+      appModuleName: 'VitestMobileApp',
+    });
+
+    const baseName = `index.${platform}.jsbundle`;
+    const bundlePath = resolve(outDir, baseName);
+
+    // Metro's runBuild types are incomplete — platform/sourceMap/sourceMapOut
+    // exist at runtime but not in the .d.ts. Cast to pass them through.
+    await runBuild(prepared.config, {
+      entry: prepared.entryPath,
+      dev,
+      minify: !dev,
+      out: bundlePath,
+      platform,
+      sourceMap: true,
+      sourceMapOut: resolve(outDir, `${baseName}.map`),
+    } as Parameters<typeof runBuild>[1]);
+
+    // Metro may append .js to the output path — detect the actual filename
+    const bundleFile = existsSync(bundlePath) ? baseName : existsSync(`${bundlePath}.js`) ? `${baseName}.js` : baseName;
+    const sourcemapFile = existsSync(resolve(outDir, `${baseName}.map`)) ? `${baseName}.map` : `${baseName}.js.map`;
+    manifest.bundles[platform] = { bundleFile, sourcemapFile };
+    log.info(`${platform} bundle written to ${bundleFile}`);
+  }
+
+  const manifestPath = resolve(outDir, 'bundle-manifest.json');
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  log.info(`Manifest written to ${manifestPath}`);
+
+  return manifest;
 }
 
 // ── Config Loading ────────────────────────────────────────────────

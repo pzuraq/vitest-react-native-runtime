@@ -1,3 +1,4 @@
+import type { Theme } from './theme';
 import type { ModuleStatus } from './types';
 
 export function statusIcon(status: ModuleStatus): string {
@@ -15,15 +16,15 @@ export function statusIcon(status: ModuleStatus): string {
   }
 }
 
-export function statusColor(status: ModuleStatus): string {
+export function statusColor(status: ModuleStatus, colors: Theme['colors']): string {
   switch (status) {
     case 'pass':
-      return '#4ade80';
+      return colors.pass;
     case 'fail':
-      return '#f87171';
+      return colors.fail;
     case 'running':
-      return '#fbbf24';
+      return colors.warning;
     default:
-      return '#64748b';
+      return colors.textDim;
   }
 }

@@ -12,10 +12,10 @@
 
 import { createHash } from 'node:crypto';
 import { execSync, type ExecSyncOptions } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, cpSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, cpSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { log } from './logger';
+import { getCacheDir } from './paths';
 import type { Platform } from './types';
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -32,6 +32,8 @@ export interface HarnessBuildOptions {
   projectRoot: string;
   /** Override cache directory. */
   cacheDir?: string;
+  /** Timeout for native build commands in milliseconds (default: 30 minutes). */
+  buildTimeout?: number;
 }
 
 export interface HarnessBuildResult {
@@ -41,10 +43,17 @@ export interface HarnessBuildResult {
   bundleId: string;
   /** Whether this was a cache hit (no build needed). */
   cached: boolean;
+  /** Deterministic cache key derived from platform, RN version, native modules, and harness version. */
+  cacheKey: string;
 }
 
 const HARNESS_BUNDLE_ID = 'com.vitest.mobile.harness';
 const HARNESS_APP_NAME = 'VitestMobileApp';
+const DEFAULT_BUILD_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+
+// Bump when the build customization changes in a way that invalidates cached
+// binaries (e.g. adding VitestMobileCacheKey to Info.plist / AndroidManifest).
+const BUILD_FORMAT_VERSION = 2;
 
 // ── Public API ─────────────────────────────────────────────────────
 
@@ -54,7 +63,8 @@ const HARNESS_APP_NAME = 'VitestMobileApp';
  * Uses a file-based lock to prevent parallel builds from concurrent pool workers.
  */
 export async function ensureHarnessBinary(options: HarnessBuildOptions): Promise<HarnessBuildResult> {
-  const cacheDir = options.cacheDir ?? getDefaultCacheDir();
+  _buildTimeout = options.buildTimeout ?? DEFAULT_BUILD_TIMEOUT;
+  const cacheDir = options.cacheDir ?? getCacheDir();
   const cacheKey = computeCacheKey(options);
   const buildDir = resolve(cacheDir, 'builds', cacheKey);
   mkdirSync(buildDir, { recursive: true });
@@ -63,7 +73,7 @@ export async function ensureHarnessBinary(options: HarnessBuildOptions): Promise
   const binaryPath = getBinaryPath(buildDir, options.platform);
   if (existsSync(binaryPath) && isBinaryValid(binaryPath, options.platform)) {
     log.info(`Using cached harness binary: ${cacheKey.slice(0, 12)}...`);
-    return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: true };
+    return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: true, cacheKey };
   }
 
   // File-based lock to prevent concurrent builds from parallel pool workers.
@@ -79,7 +89,7 @@ export async function ensureHarnessBinary(options: HarnessBuildOptions): Promise
       await new Promise<void>(r => setTimeout(r, 1000));
       if (existsSync(binaryPath)) {
         log.info('Harness binary ready (built by another worker).');
-        return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: true };
+        return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: true, cacheKey };
       }
       if (!existsSync(lockPath)) break; // lock removed = build failed
     }
@@ -98,7 +108,7 @@ export async function ensureHarnessBinary(options: HarnessBuildOptions): Promise
     log.info('');
 
     const projectDir = await scaffoldProject(buildDir, options);
-    customizeProject(projectDir, options);
+    customizeProject(projectDir, options, cacheKey);
     await buildProject(projectDir, options.platform);
 
     if (!existsSync(binaryPath)) {
@@ -107,7 +117,7 @@ export async function ensureHarnessBinary(options: HarnessBuildOptions): Promise
 
     const totalElapsed = ((Date.now() - buildStart) / 1000).toFixed(1);
     log.info(`Harness binary built and cached successfully (${totalElapsed}s total).`);
-    return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: false };
+    return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: false, cacheKey };
   } finally {
     // Remove lock so other workers (or future runs) don't hang
     try {
@@ -132,25 +142,110 @@ export function detectReactNativeVersion(projectRoot: string): string {
 }
 
 /**
- * Get the default cache directory.
+ * Remove intermediate build artifacts from the cache, keeping only the final
+ * binary (.app or .apk). This drastically reduces the cache size
+ * (from ~1.2 GB to ~100 MB for iOS) so CI cache save/restore is fast.
  */
-export function getDefaultCacheDir(): string {
-  // Follow XDG on macOS/Linux, LOCALAPPDATA on Windows
-  const envOverride = process.env.VITEST_NATIVE_CACHE_DIR;
-  if (envOverride) return envOverride;
+export function trimBuildCache(options: { platform: Platform; cacheDir?: string }): {
+  before: number;
+  after: number;
+  trimmed: boolean;
+} {
+  const cacheDir = options.cacheDir ?? getCacheDir();
+  const buildsDir = resolve(cacheDir, 'builds');
+  if (!existsSync(buildsDir)) return { before: 0, after: 0, trimmed: false };
 
-  if (process.platform === 'win32') {
-    return resolve(process.env.LOCALAPPDATA || resolve(homedir(), 'AppData', 'Local'), 'vitest-mobile');
+  const before = getDirSizeSync(buildsDir);
+
+  // Find all build hash directories
+  const entries = readdirSync(buildsDir);
+  for (const entry of entries) {
+    const buildDir = resolve(buildsDir, entry);
+    const binaryPath = getBinaryPath(buildDir, options.platform);
+    if (!existsSync(binaryPath)) continue;
+
+    const projectDir = resolve(buildDir, 'project');
+    if (!existsSync(projectDir)) continue;
+
+    if (options.platform === 'ios') {
+      // Keep only: project/ios/DerivedData/Build/Products/Debug-iphonesimulator/*.app
+      // Remove: node_modules, Pods, DerivedData/Build/Intermediates.noindex, etc.
+      const dirsToRemove = [
+        resolve(projectDir, 'node_modules'),
+        resolve(projectDir, 'ios', 'Pods'),
+        resolve(projectDir, 'ios', 'DerivedData', 'Build', 'Intermediates.noindex'),
+        resolve(projectDir, 'ios', 'DerivedData', 'Logs'),
+        resolve(projectDir, 'ios', 'DerivedData', 'ModuleCache.noindex'),
+        resolve(projectDir, 'ios', 'DerivedData', 'info.plist'),
+        resolve(projectDir, 'vendor'), // bundler gems
+        resolve(projectDir, 'android'),
+      ];
+      for (const dir of dirsToRemove) {
+        if (existsSync(dir)) {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    } else {
+      // Android: keep only the .apk
+      const dirsToRemove = [
+        resolve(projectDir, 'node_modules'),
+        resolve(projectDir, 'android', '.gradle'),
+        resolve(projectDir, 'android', 'app', 'build', 'intermediates'),
+        resolve(projectDir, 'android', 'app', 'build', 'tmp'),
+        resolve(projectDir, 'ios'),
+        resolve(projectDir, 'vendor'),
+      ];
+      for (const dir of dirsToRemove) {
+        if (existsSync(dir)) {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    }
   }
-  return resolve(process.env.XDG_CACHE_HOME || resolve(homedir(), '.cache'), 'vitest-mobile');
+
+  const after = getDirSizeSync(buildsDir);
+  log.info(`Trimmed build cache: ${formatSize(before)} → ${formatSize(after)}`);
+  return { before, after, trimmed: true };
 }
+
+function getDirSizeSync(dir: string): number {
+  let size = 0;
+  try {
+    const output = execSync(`du -sk "${dir}" 2>/dev/null || echo "0"`, {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 30_000,
+    }).trim();
+    size = parseInt(output.split('\t')[0] ?? '0', 10) * 1024;
+  } catch {
+    size = 0;
+  }
+  return size;
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(0)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+/** @deprecated Use `getCacheDir` from `./paths` directly. */
+export const getDefaultCacheDir = getCacheDir;
 
 // ── Internals ──────────────────────────────────────────────────────
 
 const BUILTIN_NATIVE_DEPS = ['react-native-safe-area-context'];
 
-function computeCacheKey(options: HarnessBuildOptions): string {
+/**
+ * Compute the deterministic cache key for a harness build configuration.
+ * Used to key both the build cache and the device snapshot cache.
+ */
+export function computeCacheKey(
+  options: Pick<HarnessBuildOptions, 'platform' | 'reactNativeVersion' | 'nativeModules' | 'packageRoot'>,
+): string {
   const parts = [
+    `fmt${BUILD_FORMAT_VERSION}`,
     options.platform,
     options.reactNativeVersion,
     ...BUILTIN_NATIVE_DEPS,
@@ -195,6 +290,8 @@ function getBinaryPath(buildDir: string, platform: Platform): string {
   return resolve(buildDir, 'build', `${HARNESS_APP_NAME}.apk`);
 }
 
+let _buildTimeout = DEFAULT_BUILD_TIMEOUT;
+
 function run(cmd: string, opts: ExecSyncOptions = {}): string {
   log.verbose(`$ ${cmd}`);
   const start = Date.now();
@@ -202,7 +299,7 @@ function run(cmd: string, opts: ExecSyncOptions = {}): string {
     execSync(cmd, {
       encoding: 'utf8',
       stdio: 'pipe',
-      timeout: 600000,
+      timeout: _buildTimeout,
       env: { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' },
       ...opts,
     }) as string
@@ -218,7 +315,7 @@ function runLive(cmd: string, opts: ExecSyncOptions = {}): void {
   execSync(cmd, {
     encoding: 'utf8',
     stdio: 'inherit',
-    timeout: 600000,
+    timeout: _buildTimeout,
     env: { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' },
     ...opts,
   });
@@ -256,14 +353,15 @@ async function scaffoldProject(buildDir: string, options: HarnessBuildOptions): 
 
 // ── Customize ──────────────────────────────────────────────────────
 
-function customizeProject(projectDir: string, options: HarnessBuildOptions): void {
+function customizeProject(projectDir: string, options: HarnessBuildOptions, cacheKey: string): void {
   log.info('Customizing harness project...');
 
-  // 1. Write our AppDelegate
+  const iconsDir = resolve(options.packageRoot, 'assets', 'icons');
+
   if (options.platform === 'ios') {
-    customizeIOS(projectDir);
+    customizeIOS(projectDir, iconsDir, cacheKey);
   } else {
-    customizeAndroid(projectDir);
+    customizeAndroid(projectDir, iconsDir, cacheKey);
   }
 
   // 2. Write a minimal package.json (for npm install)
@@ -301,12 +399,8 @@ function customizeProject(projectDir: string, options: HarnessBuildOptions): voi
   log.info(`  Dependencies installed (${((Date.now() - depsStart) / 1000).toFixed(1)}s)`);
 }
 
-function customizeIOS(projectDir: string): void {
+function customizeIOS(projectDir: string, iconsDir: string, cacheKey: string): void {
   const iosDir = resolve(projectDir, 'ios');
-
-  // VitestMobileHarness TurboModule is autolinked via react-native.config.cjs
-  // (included because vitest-mobile is in package.json deps).
-  // We only need to bump the iOS deployment target.
 
   const podfilePath = resolve(iosDir, 'Podfile');
   if (existsSync(podfilePath)) {
@@ -317,7 +411,6 @@ function customizeIOS(projectDir: string): void {
 
   updateIOSBundleId(projectDir);
 
-  // Set a short display name for the home screen
   const infoPlistPath = resolve(iosDir, HARNESS_APP_NAME, 'Info.plist');
   if (existsSync(infoPlistPath)) {
     let plist = readFileSync(infoPlistPath, 'utf8');
@@ -325,22 +418,25 @@ function customizeIOS(projectDir: string): void {
       /<key>CFBundleDisplayName<\/key>\s*<string>[^<]*<\/string>/,
       '<key>CFBundleDisplayName</key>\n\t<string>Vitest</string>',
     );
+    plist = plist.replace(
+      /<\/dict>\s*<\/plist>/,
+      `\t<key>VitestMobileCacheKey</key>\n\t<string>${cacheKey}</string>\n</dict>\n</plist>`,
+    );
     writeFileSync(infoPlistPath, plist);
   }
+
+  installIOSIcons(iosDir, iconsDir);
+  installIOSSplash(iosDir, iconsDir);
 }
 
-function customizeAndroid(projectDir: string): void {
+function customizeAndroid(projectDir: string, iconsDir: string, cacheKey: string): void {
   const androidDir = resolve(projectDir, 'android');
 
-  // Update the applicationId in build.gradle
   const appBuildGradle = resolve(androidDir, 'app', 'build.gradle');
   if (existsSync(appBuildGradle)) {
     let content = readFileSync(appBuildGradle, 'utf8');
     content = content.replace(/applicationId\s+"[^"]+"/, `applicationId "${HARNESS_BUNDLE_ID}"`);
     content = content.replace(/minSdk\s*=\s*\d+/, 'minSdk = 24');
-    // Override React Native's default dev server port (8081) so the app
-    // connects to our Metro instance on 18081 out of the box.  The resource
-    // is read by AndroidInfoHelpers.getDevServerPort().
     content = content.replace(
       /(defaultConfig\s*\{[^}]*versionName\s+"[^"]*")/,
       '$1\n        resValue "integer", "react_native_dev_server_port", "18081"',
@@ -348,13 +444,316 @@ function customizeAndroid(projectDir: string): void {
     writeFileSync(appBuildGradle, content);
   }
 
-  // Set display name to "Vitest"
   const stringsPath = resolve(androidDir, 'app', 'src', 'main', 'res', 'values', 'strings.xml');
   if (existsSync(stringsPath)) {
     let strings = readFileSync(stringsPath, 'utf8');
     strings = strings.replace(/<string name="app_name">[^<]*<\/string>/, '<string name="app_name">Vitest</string>');
     writeFileSync(stringsPath, strings);
   }
+
+  const manifestPath = resolve(androidDir, 'app', 'src', 'main', 'AndroidManifest.xml');
+  if (existsSync(manifestPath)) {
+    let manifest = readFileSync(manifestPath, 'utf8');
+    manifest = manifest.replace(
+      /<\/application>/,
+      `    <meta-data android:name="vitest-mobile-cache-key" android:value="${cacheKey}" />\n    </application>`,
+    );
+    writeFileSync(manifestPath, manifest);
+  }
+
+  installAndroidIcons(androidDir, iconsDir);
+  installAndroidSplash(androidDir, iconsDir);
+}
+
+function installIOSIcons(iosDir: string, iconsDir: string): void {
+  const srcIconsDir = resolve(iconsDir, 'ios');
+  if (!existsSync(srcIconsDir)) {
+    log.verbose('No iOS icons found in assets, skipping icon installation');
+    return;
+  }
+
+  const appIconSetDir = resolve(iosDir, HARNESS_APP_NAME, 'Images.xcassets', 'AppIcon.appiconset');
+  if (!existsSync(appIconSetDir)) {
+    mkdirSync(appIconSetDir, { recursive: true });
+  }
+
+  cpSync(srcIconsDir, appIconSetDir, { recursive: true });
+  log.verbose('Installed iOS app icons');
+}
+
+function installIOSSplash(iosDir: string, iconsDir: string): void {
+  // Use app-icon.png (1024x1024 square icon) rather than the full-screen
+  // splash-portrait.png. The storyboard provides the dark background and
+  // centers the icon via constraints — using the full splash image causes
+  // scaling artifacts when squeezed into the imageView.
+  const iconSrc = resolve(iconsDir, 'app-icon.png');
+  if (!existsSync(iconSrc)) {
+    log.verbose('No app icon found in assets, skipping splash installation');
+    return;
+  }
+
+  const splashImageSetDir = resolve(iosDir, HARNESS_APP_NAME, 'Images.xcassets', 'SplashImage.imageset');
+  mkdirSync(splashImageSetDir, { recursive: true });
+
+  cpSync(iconSrc, resolve(splashImageSetDir, 'splash.png'));
+  writeFileSync(
+    resolve(splashImageSetDir, 'Contents.json'),
+    JSON.stringify(
+      {
+        images: [{ filename: 'splash.png', idiom: 'universal' }],
+        info: { version: 1, author: 'vitest-mobile' },
+      },
+      null,
+      2,
+    ),
+  );
+
+  // Modify the template LaunchScreen.storyboard rather than replacing it
+  // wholesale. This preserves the toolsVersion / systemVersion attributes
+  // that match the user's Xcode, avoiding "Unknown target runtime" or
+  // version-mismatch failures across different Xcode installs.
+  const storyboardPath = resolve(iosDir, HARNESS_APP_NAME, 'LaunchScreen.storyboard');
+  if (!existsSync(storyboardPath)) {
+    log.verbose('LaunchScreen.storyboard not found, skipping splash modification');
+    return;
+  }
+
+  let storyboard = readFileSync(storyboardPath, 'utf8');
+
+  // Extract the <document ...> opening tag so we keep its attributes intact
+  const docMatch = storyboard.match(/<document[^>]+>/);
+  if (!docMatch) {
+    log.verbose('Could not parse LaunchScreen.storyboard, skipping splash modification');
+    return;
+  }
+  const docTag = docMatch[0];
+
+  // Find the view controller ID used in the template (initialViewController attr)
+  const vcIdMatch = docTag.match(/initialViewController="([^"]+)"/);
+  const vcId = vcIdMatch?.[1] ?? '01J-lp-oVM';
+
+  // Build a new storyboard body that uses the template's document header.
+  // We generate the scene contents ourselves to get the splash image + dark bg,
+  // but the <document> attributes come from whatever Xcode version scaffolded it.
+  storyboard = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    docTag,
+    `    <scenes>`,
+    `        <scene sceneID="EHf-IW-A2E">`,
+    `            <objects>`,
+    `                <viewController id="${vcId}" sceneMemberID="viewController">`,
+    `                    <view key="view" contentMode="scaleToFill" id="Ze5-6b-2t3">`,
+    `                        <rect key="frame" x="0.0" y="0.0" width="393" height="852"/>`,
+    `                        <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>`,
+    `                        <subviews>`,
+    `                            <imageView clipsSubviews="YES" userInteractionEnabled="NO" contentMode="scaleAspectFit" image="SplashImage" translatesAutoresizingMaskIntoConstraints="NO" id="Kdr-Md-lw4">`,
+    `                                <rect key="frame" x="56.5" y="286" width="280" height="280"/>`,
+    `                                <constraints>`,
+    `                                    <constraint firstAttribute="width" constant="280" id="Wid-th-c01"/>`,
+    `                                    <constraint firstAttribute="height" constant="280" id="Hei-gh-c01"/>`,
+    `                                </constraints>`,
+    `                            </imageView>`,
+    `                        </subviews>`,
+    `                        <viewLayoutGuide key="safeArea" id="Bcu-se-gPh"/>`,
+    `                        <color key="backgroundColor" red="0.11764705882352941" green="0.11764705882352941" blue="0.11764705882352941" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>`,
+    `                        <constraints>`,
+    `                            <constraint firstItem="Kdr-Md-lw4" firstAttribute="centerX" secondItem="Ze5-6b-2t3" secondAttribute="centerX" id="CnX-vm-c01"/>`,
+    `                            <constraint firstItem="Kdr-Md-lw4" firstAttribute="centerY" secondItem="Ze5-6b-2t3" secondAttribute="centerY" id="CnY-vm-c01"/>`,
+    `                        </constraints>`,
+    `                    </view>`,
+    `                </viewController>`,
+    `                <placeholder placeholderIdentifier="IBFirstResponder" id="iYj-Kq-Ea1" userLabel="First Responder" sceneMemberID="firstResponder"/>`,
+    `            </objects>`,
+    `            <point key="canvasLocation" x="0" y="0"/>`,
+    `        </scene>`,
+    `    </scenes>`,
+    `    <resources>`,
+    `        <image name="SplashImage" width="280" height="280"/>`,
+    `    </resources>`,
+    `</document>`,
+  ].join('\n');
+
+  writeFileSync(storyboardPath, storyboard);
+  log.verbose('Installed iOS splash screen');
+}
+
+function installAndroidIcons(androidDir: string, iconsDir: string): void {
+  const srcAndroidDir = resolve(iconsDir, 'android');
+  if (!existsSync(srcAndroidDir)) {
+    log.verbose('No Android icons found in assets, skipping icon installation');
+    return;
+  }
+
+  const resDir = resolve(androidDir, 'app', 'src', 'main', 'res');
+  const densities = ['mipmap-mdpi', 'mipmap-hdpi', 'mipmap-xhdpi', 'mipmap-xxhdpi', 'mipmap-xxxhdpi'];
+
+  for (const density of densities) {
+    const srcIcon = resolve(srcAndroidDir, density, 'ic_launcher.png');
+    if (!existsSync(srcIcon)) continue;
+
+    const targetDir = resolve(resDir, density);
+    mkdirSync(targetDir, { recursive: true });
+
+    cpSync(srcIcon, resolve(targetDir, 'ic_launcher.png'));
+    cpSync(srcIcon, resolve(targetDir, 'ic_launcher_round.png'));
+  }
+
+  // Set up adaptive icon (API 26+) using the foreground image + solid background.
+  // This makes the icon fill the launcher shape (circle, squircle, etc.) properly.
+  const adaptiveSrc = resolve(iconsDir, 'adaptive-icon.png');
+  if (existsSync(adaptiveSrc)) {
+    for (const density of densities) {
+      const targetDir = resolve(resDir, density);
+      mkdirSync(targetDir, { recursive: true });
+      cpSync(adaptiveSrc, resolve(targetDir, 'ic_launcher_foreground.png'));
+    }
+
+    const adaptiveDir = resolve(resDir, 'mipmap-anydpi-v26');
+    mkdirSync(adaptiveDir, { recursive: true });
+
+    const adaptiveXml = [
+      '<?xml version="1.0" encoding="utf-8"?>',
+      '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">',
+      '    <background android:drawable="@color/ic_launcher_background"/>',
+      '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>',
+      '</adaptive-icon>',
+    ].join('\n');
+
+    writeFileSync(resolve(adaptiveDir, 'ic_launcher.xml'), adaptiveXml);
+    writeFileSync(resolve(adaptiveDir, 'ic_launcher_round.xml'), adaptiveXml);
+
+    // Add the launcher background color
+    const colorsPath = resolve(resDir, 'values', 'colors.xml');
+    if (existsSync(colorsPath)) {
+      let colors = readFileSync(colorsPath, 'utf8');
+      if (!colors.includes('ic_launcher_background')) {
+        colors = colors.replace(
+          '</resources>',
+          '    <color name="ic_launcher_background">#1E1E1E</color>\n</resources>',
+        );
+        writeFileSync(colorsPath, colors);
+      }
+    } else {
+      mkdirSync(resolve(resDir, 'values'), { recursive: true });
+      writeFileSync(
+        colorsPath,
+        [
+          '<?xml version="1.0" encoding="utf-8"?>',
+          '<resources>',
+          '    <color name="ic_launcher_background">#1E1E1E</color>',
+          '</resources>',
+        ].join('\n'),
+      );
+    }
+  }
+
+  log.verbose('Installed Android app icons');
+}
+
+function installAndroidSplash(androidDir: string, iconsDir: string): void {
+  // Use app-icon.png (1024x1024 square icon) rather than the full-screen
+  // splash-android.png. The layer-list drawable provides the dark background
+  // and centers the icon — using the full splash image causes scaling artifacts.
+  const iconSrc = resolve(iconsDir, 'app-icon.png');
+  if (!existsSync(iconSrc)) {
+    log.verbose('No app icon found in assets, skipping splash installation');
+    return;
+  }
+
+  const resDir = resolve(androidDir, 'app', 'src', 'main', 'res');
+
+  const drawableDir = resolve(resDir, 'drawable');
+  mkdirSync(drawableDir, { recursive: true });
+  cpSync(iconSrc, resolve(drawableDir, 'splash_image.png'));
+
+  writeFileSync(
+    resolve(drawableDir, 'splash_background.xml'),
+    [
+      '<?xml version="1.0" encoding="utf-8"?>',
+      '<layer-list xmlns:android="http://schemas.android.com/apk/res/android">',
+      '  <item android:drawable="@color/splash_background_color"/>',
+      '  <item>',
+      '    <bitmap android:gravity="center" android:src="@drawable/splash_image"/>',
+      '  </item>',
+      '</layer-list>',
+    ].join('\n'),
+  );
+
+  // Add the splash background color to colors.xml.
+  // RN templates vary — some have colors.xml, some don't — so we handle both.
+  const colorsPath = resolve(resDir, 'values', 'colors.xml');
+  if (existsSync(colorsPath)) {
+    let colors = readFileSync(colorsPath, 'utf8');
+    if (!colors.includes('splash_background_color')) {
+      colors = colors.replace(
+        '</resources>',
+        '    <color name="splash_background_color">#1E1E1E</color>\n</resources>',
+      );
+      writeFileSync(colorsPath, colors);
+    }
+  } else {
+    mkdirSync(resolve(resDir, 'values'), { recursive: true });
+    writeFileSync(
+      colorsPath,
+      [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<resources>',
+        '    <color name="splash_background_color">#1E1E1E</color>',
+        '</resources>',
+      ].join('\n'),
+    );
+  }
+
+  // Read the manifest to discover what theme the MainActivity currently uses,
+  // then create a BootTheme that extends it with our splash background.
+  // This handles any RN template version (AppTheme, Theme.App.SplashScreen, etc.)
+  const manifestPath = resolve(androidDir, 'app', 'src', 'main', 'AndroidManifest.xml');
+  if (!existsSync(manifestPath)) {
+    log.verbose('AndroidManifest.xml not found, skipping splash theme');
+    return;
+  }
+
+  let manifest = readFileSync(manifestPath, 'utf8');
+
+  // Discover what theme to extend. Check the activity first, then fall back to
+  // the application-level theme (the common case in RN templates).
+  const activityBlock = manifest.match(/<activity[^>]*android:name="\.MainActivity"[^>]*>/s)?.[0];
+  const activityTheme = activityBlock?.match(/android:theme="@style\/([^"]+)"/)?.[1];
+  const appTheme = manifest.match(/<application[^>]*android:theme="@style\/([^"]+)"/s)?.[1];
+  const parentTheme = activityTheme ?? appTheme ?? 'AppTheme';
+
+  const splashStylesPath = resolve(resDir, 'values', 'splash_styles.xml');
+  writeFileSync(
+    splashStylesPath,
+    [
+      '<?xml version="1.0" encoding="utf-8"?>',
+      '<resources>',
+      `    <style name="BootTheme" parent="${parentTheme}">`,
+      '        <item name="android:windowBackground">@drawable/splash_background</item>',
+      '    </style>',
+      '</resources>',
+    ].join('\n'),
+  );
+
+  if (activityTheme) {
+    // Activity already has a theme — replace it
+    manifest = manifest.replace(
+      new RegExp(`(<activity[^>]*android:name="\\.MainActivity"[^>]*?)android:theme="@style/${activityTheme}"`, 's'),
+      '$1android:theme="@style/BootTheme"',
+    );
+    manifest = manifest.replace(
+      new RegExp(`android:theme="@style/${activityTheme}"([^>]*?android:name="\\.MainActivity")`, 's'),
+      'android:theme="@style/BootTheme"$1',
+    );
+  } else {
+    // No theme on activity (inherits from <application>) — add one
+    manifest = manifest.replace(
+      /(<activity\s+android:name="\.MainActivity")/s,
+      '$1\n            android:theme="@style/BootTheme"',
+    );
+  }
+  writeFileSync(manifestPath, manifest);
+  log.verbose('Installed Android splash screen');
 }
 
 function updateIOSBundleId(projectDir: string): void {
@@ -395,30 +794,8 @@ async function buildIOS(projectDir: string): Promise<void> {
   runLive('bundle exec pod install', { cwd: iosDir });
   log.info(`  Pods installed (${((Date.now() - stepStart) / 1000).toFixed(1)}s)`);
 
-  // Build for simulator — need a concrete simulator destination to produce
-  // a runnable executable (generic/platform builds don't include the binary)
   log.info('Building for iOS simulator (this may take a few minutes)...');
   stepStart = Date.now();
-
-  // Find a booted simulator UUID for the destination
-  let simUdid = '';
-  try {
-    const bootedJson = run('xcrun simctl list devices booted -j');
-    const parsed = JSON.parse(bootedJson);
-    for (const devices of Object.values(parsed.devices) as { state?: string; udid?: string }[][]) {
-      for (const d of devices) {
-        if (d.state === 'Booted' && d.udid) {
-          simUdid = d.udid;
-          break;
-        }
-      }
-      if (simUdid) break;
-    }
-  } catch {
-    /* fall through */
-  }
-
-  const destination = simUdid ? `'platform=iOS Simulator,id=${simUdid}'` : "'platform=iOS Simulator,name=iPhone 16'"; // fallback
 
   const buildCmd = [
     'xcodebuild build',
@@ -427,7 +804,6 @@ async function buildIOS(projectDir: string): Promise<void> {
     '-sdk iphonesimulator',
     '-configuration Debug',
     `-derivedDataPath "${resolve(iosDir, 'DerivedData')}"`,
-    `-destination ${destination}`,
   ].join(' ');
 
   runLive(buildCmd, { cwd: iosDir });
@@ -463,7 +839,6 @@ async function buildAndroid(projectDir: string): Promise<void> {
   run(`chmod +x "${gradlew}"`, { cwd: androidDir });
   run(`"${gradlew}" assembleDebug -x lint --no-daemon`, {
     cwd: androidDir,
-    timeout: 600000,
   });
   log.info(`  Gradle build complete (${((Date.now() - gradleStart) / 1000).toFixed(1)}s)`);
 

@@ -23,6 +23,8 @@ interface TestHarnessConfig {
   host?: string;
   metroPort?: number;
   metroHost?: string;
+  /** UI color scheme. Defaults to 'dark'. */
+  theme?: 'light' | 'dark';
 }
 
 export function createTestHarness(config: TestHarnessConfig = {}) {
@@ -30,6 +32,7 @@ export function createTestHarness(config: TestHarnessConfig = {}) {
   const port = config.port ?? 7878;
   const metroHost = config.metroHost ?? '127.0.0.1';
   const metroPort = config.metroPort ?? 8081;
+  const themeMode = config.theme ?? 'dark';
 
   configureRuntimeNetwork({
     wsHost: host,
@@ -45,7 +48,7 @@ export function createTestHarness(config: TestHarnessConfig = {}) {
     return (
       <SafeAreaProvider>
         <TestContainerProvider>
-          <TestExplorer />
+          <TestExplorer themeMode={themeMode} />
         </TestContainerProvider>
       </SafeAreaProvider>
     );

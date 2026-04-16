@@ -8,6 +8,7 @@ import { execSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { log } from './logger';
+import { getAdbPath } from './exec-utils';
 import { isAndroidDeviceOnline, getBootedSimulator } from './device';
 import type { Platform } from './types';
 
@@ -84,7 +85,7 @@ export function captureScreenshot(options: ScreenshotOptions): ScreenshotResult 
 function captureAndroid(filePath: string, deviceId?: string): void {
   try {
     const target = deviceId ? `-s ${deviceId} ` : '';
-    const buffer = execSync(`adb ${target}exec-out screencap -p`, {
+    const buffer = execSync(`${getAdbPath()} ${target}exec-out screencap -p`, {
       encoding: 'buffer',
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: 10000,

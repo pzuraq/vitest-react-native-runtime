@@ -8,13 +8,14 @@
  * serializes the selection so two concurrent startups can't claim the same device.
  */
 
-import { execSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
+import { execSync, spawn, type ExecSyncOptions } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, rmSync } from 'node:fs';
 import { connect as netConnect } from 'node:net';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
 import { log } from './logger';
-import { run, getAndroidHome } from './exec-utils';
+import { run, getAndroidHome, getAdbPath } from './exec-utils';
+import { getCacheDir } from './paths';
 import type { DeviceOptions, Platform } from './types';
 
 /** One simulator row from `xcrun simctl list devices -j`. */
@@ -88,6 +89,13 @@ function parseSimctlDevicesJson(json: string): SimctlDevicesJson | null {
 let poolBootedEmulator = false;
 let _poolBootedAndroidSerial: string | null = null;
 
+// Resolve adb once and reuse — bare 'adb' isn't on PATH on all CI runners.
+let _adb: string | undefined;
+function adb(): string {
+  if (!_adb) _adb = getAdbPath();
+  return _adb;
+}
+
 // ── Liveness detection ──────────────────────────────────────────
 
 const DEFAULT_BUNDLE_ID = 'com.vitest.mobile.harness';
@@ -145,7 +153,7 @@ async function isSimulatorActivelyInUse(udid: string, bundleId: string): Promise
  */
 function getAndroidMetroPort(serial: string, bundleId: string): number | null {
   try {
-    const xml = run(`adb -s ${serial} shell "run-as ${bundleId} cat shared_prefs/${bundleId}_preferences.xml"`);
+    const xml = run(`${adb()} -s ${serial} shell "run-as ${bundleId} cat shared_prefs/${bundleId}_preferences.xml"`);
     if (!xml) return null;
     const match = xml.match(/debug_http_host[^>]*>([^<]+)/);
     if (!match) return null;
@@ -164,11 +172,11 @@ function getAndroidMetroPort(serial: string, bundleId: string): number | null {
 // Ctrl-C), the port goes free and the device becomes available again.
 
 function androidClaimPath(serial: string): string {
-  return resolve(globalCacheDir(), `android-device-${serial}.json`);
+  return resolve(getCacheDir(), `android-device-${serial}.json`);
 }
 
 function claimAndroidDevice(serial: string, instanceId: string, metroPort: number): void {
-  mkdirSync(globalCacheDir(), { recursive: true });
+  mkdirSync(getCacheDir(), { recursive: true });
   writeFileSync(androidClaimPath(serial), JSON.stringify({ pid: process.pid, instanceId, metroPort, ts: Date.now() }));
 }
 
@@ -210,7 +218,7 @@ async function isAndroidDeviceActivelyInUse(
 
   // 3. Fallback: app process still running (only when no claim file exists)
   try {
-    const pid = run(`adb -s ${serial} shell pidof ${bundleId}`);
+    const pid = run(`${adb()} -s ${serial} shell pidof ${bundleId}`);
     return !!pid && pid.trim() !== '';
   } catch {
     return false;
@@ -225,13 +233,6 @@ async function isAndroidDeviceActivelyInUse(
 const LOCK_TIMEOUT_MS = 120_000;
 const LOCK_POLL_MS = 300;
 
-function globalCacheDir(): string {
-  if (process.platform === 'win32') {
-    return resolve(process.env.LOCALAPPDATA || resolve(homedir(), 'AppData', 'Local'), 'vitest-mobile');
-  }
-  return resolve(process.env.XDG_CACHE_HOME || resolve(homedir(), '.cache'), 'vitest-mobile');
-}
-
 function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -242,7 +243,7 @@ function isPidAlive(pid: number): boolean {
 }
 
 async function withDeviceLock<T>(fn: () => Promise<T>): Promise<T> {
-  const dir = globalCacheDir();
+  const dir = getCacheDir();
   mkdirSync(dir, { recursive: true });
   const lockPath = join(dir, 'device.lock');
   const lockContent = `${process.pid}:${Date.now()}`;
@@ -300,7 +301,7 @@ export function isAndroidDeviceOnline(): boolean {
 }
 
 function getAndroidOnlineSerials(): string[] {
-  const output = run('adb devices');
+  const output = run(`${adb()} devices`);
   if (!output) return [];
   const lines = output.split('\n').slice(1);
   return lines
@@ -311,12 +312,40 @@ function getAndroidOnlineSerials(): string[] {
     .filter(Boolean);
 }
 
+/** Env with ANDROID_AVD_HOME set so all Android tools find our AVDs. */
+function androidEnv(): Record<string, string | undefined> {
+  return { ...process.env, ANDROID_AVD_HOME: avdHome() };
+}
+
 function getAllAVDs(): string[] {
   const home = getAndroidHome();
   const emulatorBin = run('which emulator') || resolve(home, 'emulator/emulator');
-  const avds = run(`"${emulatorBin}" -list-avds`);
-  if (!avds) return [];
-  return avds.split('\n').filter(Boolean);
+  try {
+    const avds = (
+      execSync(`"${emulatorBin}" -list-avds`, {
+        encoding: 'utf8',
+        stdio: 'pipe',
+        timeout: 15_000,
+        env: androidEnv(),
+      }) as string
+    ).trim();
+    if (avds) return avds.split('\n').filter(Boolean);
+  } catch {
+    // emulator binary may not exist or may timeout
+  }
+
+  // Fallback: read the AVD directory directly
+  const avdDir = avdHome();
+  if (!existsSync(avdDir)) return [];
+  try {
+    const entries = execSync(`ls "${avdDir}"`, { encoding: 'utf8', stdio: 'pipe' }).trim();
+    return entries
+      .split('\n')
+      .filter(e => e.endsWith('.ini') && !e.includes('.avd'))
+      .map(e => e.replace(/\.ini$/, ''));
+  } catch {
+    return [];
+  }
 }
 
 function getFirstAVD(): string | null {
@@ -329,7 +358,7 @@ function getFirstAVD(): string | null {
  */
 function getRunningEmulatorAVD(serial: string): string | null {
   try {
-    const name = run(`adb -s ${serial} emu avd name 2>/dev/null`);
+    const name = run(`${adb()} -s ${serial} emu avd name 2>/dev/null`);
     if (name) {
       const first = name.split('\n')[0]?.trim();
       if (first && first !== 'KO:') return first;
@@ -357,18 +386,272 @@ function pickEmulatorConsolePort(excludeSerials: string[]): number {
   return 5554;
 }
 
+// ── Android auto-provisioning ────────────────────────────────────
+//
+// When --api-level is specified (or we're running headless with no AVDs),
+// automatically install the system image and create an AVD — the same
+// things ReactiveCircus/android-emulator-runner does.
+
+const DEFAULT_API_LEVEL = 35;
+const DEFAULT_ARCH = 'x86_64';
+const DEFAULT_TARGET = 'default';
+const AUTO_AVD_NAME = 'vitest-mobile';
+
+function findBin(name: string, subdirs: string[]): string {
+  const home = getAndroidHome();
+  for (const sub of subdirs) {
+    const candidate = resolve(home, sub, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return name;
+}
+
+function sdkManagerBin(): string {
+  return findBin('sdkmanager', ['cmdline-tools/latest/bin', 'tools/bin']);
+}
+
+function avdManagerBin(): string {
+  return findBin('avdmanager', ['cmdline-tools/latest/bin', 'tools/bin']);
+}
+
+function runLong(cmd: string, opts: ExecSyncOptions = {}): string {
+  log.verbose(`$ ${cmd}`);
+  const result = (
+    execSync(cmd, {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 300_000,
+      ...opts,
+    }) as string
+  ).trim();
+  return result;
+}
+
+function systemImagePackage(apiLevel: number, target = DEFAULT_TARGET, arch = DEFAULT_ARCH): string {
+  return `system-images;android-${apiLevel};${target};${arch}`;
+}
+
+function isSystemImageInstalled(apiLevel: number, target = DEFAULT_TARGET, arch = DEFAULT_ARCH): boolean {
+  const home = getAndroidHome();
+  const imagePath = resolve(home, 'system-images', `android-${apiLevel}`, target, arch);
+  return existsSync(imagePath);
+}
+
+function installSystemImage(apiLevel: number, target = DEFAULT_TARGET, arch = DEFAULT_ARCH): void {
+  const pkg = systemImagePackage(apiLevel, target, arch);
+  log.info(`Installing Android system image: ${pkg}`);
+  const start = Date.now();
+
+  try {
+    runLong(`yes | ${sdkManagerBin()} --licenses`, { timeout: 60_000 });
+  } catch {
+    // Non-fatal — licenses may already be accepted
+  }
+
+  runLong(`${sdkManagerBin()} --install '${pkg}'`);
+  log.info(`  System image installed (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+}
+
+/**
+ * Resolve the directory where AVDs are stored. Defaults to our own
+ * cache dir so everything vitest-mobile manages lives under one root
+ * (~/.cache/vitest-mobile/avd on Linux/macOS). Respects ANDROID_AVD_HOME
+ * if explicitly set by the user.
+ */
+function avdHome(): string {
+  if (process.env.ANDROID_AVD_HOME) return process.env.ANDROID_AVD_HOME;
+  return resolve(getCacheDir(), 'avd');
+}
+
+function ensureAvd(apiLevel: number, target = DEFAULT_TARGET, arch = DEFAULT_ARCH): string {
+  const existing = getAllAVDs();
+  if (existing.includes(AUTO_AVD_NAME)) return AUTO_AVD_NAME;
+
+  const pkg = systemImagePackage(apiLevel, target, arch);
+  const avdBin = avdManagerBin();
+  const avdDir = avdHome();
+
+  log.info(`Creating AVD: ${AUTO_AVD_NAME} (API ${apiLevel}, ${arch})`);
+  log.info(`  avdmanager: ${avdBin}`);
+  log.info(`  AVD home: ${avdDir}`);
+
+  // Ensure the AVD directory exists — avdmanager can silently fail
+  // if ~/.android/avd doesn't exist on a fresh CI runner.
+  mkdirSync(avdDir, { recursive: true });
+
+  try {
+    const output = runLong(`echo no | ${avdBin} create avd --force -n ${AUTO_AVD_NAME} --package '${pkg}'`, {
+      env: androidEnv(),
+    });
+    if (output) log.verbose(`avdmanager: ${output}`);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`Failed to create AVD:\n${msg}`);
+  }
+
+  const avdIni = resolve(avdDir, `${AUTO_AVD_NAME}.ini`);
+  if (!existsSync(avdIni)) {
+    let contents = '(directory does not exist)';
+    if (existsSync(avdDir)) {
+      try {
+        contents = execSync(`ls -la "${avdDir}"`, { encoding: 'utf8', stdio: 'pipe' }).trim();
+      } catch {
+        contents = '(could not list)';
+      }
+    }
+    throw new Error(
+      `avdmanager reported success but AVD was not created.\n` +
+        `  Expected: ${avdIni}\n` +
+        `  AVD home (${avdDir}) contents:\n${contents}`,
+    );
+  }
+
+  log.info(`  AVD created at ${avdDir}`);
+  return AUTO_AVD_NAME;
+}
+
+function disableAndroidAnimations(serial: string): void {
+  const target = `-s ${serial}`;
+  try {
+    run(`${adb()} ${target} shell settings put global window_animation_scale 0.0`);
+    run(`${adb()} ${target} shell settings put global transition_animation_scale 0.0`);
+    run(`${adb()} ${target} shell settings put global animator_duration_scale 0.0`);
+    log.verbose('Disabled animations');
+  } catch {
+    log.verbose('Could not disable animations (non-fatal)');
+  }
+}
+
+/**
+ * Ensure an Android system image + AVD exist, installing if needed.
+ * Called before bootAndroidEmulator when apiLevel is specified or
+ * no AVDs exist on a headless (CI) runner.
+ */
+function ensureAndroidEmulatorReady(apiLevel: number): string {
+  if (!isSystemImageInstalled(apiLevel)) {
+    installSystemImage(apiLevel);
+  } else {
+    log.verbose(`System image already installed for API ${apiLevel}`);
+  }
+  return ensureAvd(apiLevel);
+}
+
+function snapshotMarkerPath(avdName: string): string {
+  return resolve(avdHome(), `${avdName}.avd`, '.vitest-snapshot-ready');
+}
+
+/**
+ * Check if the AVD has a warm-up snapshot we created. Uses a marker file
+ * rather than `emulator -snapshot-list` which can leave orphan QEMU processes.
+ */
+function hasAvdSnapshot(avdName: string): boolean {
+  return existsSync(snapshotMarkerPath(avdName));
+}
+
+/**
+ * Spawn the emulator and wait for it to finish booting.
+ * Returns the ChildProcess and the serial. Throws on timeout or crash.
+ */
+async function spawnAndWaitForBoot(
+  emulatorBin: string,
+  args: string[],
+  expectedSerial: string,
+  timeoutIterations = 90,
+): Promise<import('node:child_process').ChildProcess> {
+  if (!existsSync(emulatorBin)) {
+    throw new Error(`Emulator binary not found: ${emulatorBin}`);
+  }
+
+  // Ensure adb server is running before launching the emulator so it
+  // can detect the emulator's console port as soon as it's up.
+  run(`${adb()} start-server`);
+
+  let emulatorOutput = '';
+  let spawnError: Error | null = null;
+  const emuProc = spawn(emulatorBin, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
+    env: androidEnv(),
+  });
+  emuProc.on('error', (err: Error) => {
+    spawnError = err;
+  });
+  emuProc.stdout?.on('data', (chunk: Buffer) => {
+    emulatorOutput += chunk.toString();
+  });
+  emuProc.stderr?.on('data', (chunk: Buffer) => {
+    emulatorOutput += chunk.toString();
+  });
+  emuProc.unref();
+  (emuProc.stdout as NodeJS.ReadableStream & { unref?: () => void })?.unref?.();
+  (emuProc.stderr as NodeJS.ReadableStream & { unref?: () => void })?.unref?.();
+
+  log.verbose(`Waiting for ${expectedSerial} to boot (timeout: ${timeoutIterations * 2}s)...`);
+
+  for (let i = 0; i < timeoutIterations; i++) {
+    const online = getAndroidOnlineSerials();
+
+    if (online.includes(expectedSerial)) {
+      try {
+        const prop = run(`${adb()} -s ${expectedSerial} shell getprop sys.boot_completed`);
+        if (prop === '1') return emuProc;
+      } catch {
+        /* device not ready yet */
+      }
+    }
+
+    if (spawnError) {
+      throw new Error(`Failed to spawn emulator: ${(spawnError as Error).message}`);
+    }
+    if (emuProc.exitCode !== null) {
+      throw new Error(
+        `Emulator process exited with code ${emuProc.exitCode} before ${expectedSerial} came online.\n${emulatorOutput.slice(-500)}`,
+      );
+    }
+
+    await new Promise<void>(r => setTimeout(r, 2000));
+  }
+  try {
+    emuProc.kill();
+  } catch {
+    /* ignore */
+  }
+  throw new Error(`Emulator ${expectedSerial} did not finish booting in time.\n${emulatorOutput.slice(-1000)}`);
+}
+
+/** Cleanly shut down an emulator via adb so it saves its snapshot. */
+async function killEmulatorCleanly(serial: string): Promise<void> {
+  run(`${adb()} -s ${serial} emu kill`);
+  // Wait for the process to exit and snapshot to flush
+  for (let i = 0; i < 15; i++) {
+    const online = getAndroidOnlineSerials();
+    if (!online.includes(serial)) return;
+    await new Promise<void>(r => setTimeout(r, 1000));
+  }
+}
+
 async function bootAndroidEmulator({
   headless = true,
   bundleId = DEFAULT_BUNDLE_ID,
   promptForNewDevice = true,
   excludeSerials = [],
+  apiLevel,
 }: {
   headless?: boolean;
   bundleId?: string;
   promptForNewDevice?: boolean;
   excludeSerials?: string[];
+  apiLevel?: number;
 } = {}): Promise<string> {
-  const allAvds = getAllAVDs();
+  let allAvds = getAllAVDs();
+
+  // Auto-provision if an API level was explicitly requested, or if we're
+  // headless (CI) and have no AVDs at all.
+  if (apiLevel || (headless && allAvds.length === 0)) {
+    ensureAndroidEmulatorReady(apiLevel ?? DEFAULT_API_LEVEL);
+    allAvds = getAllAVDs();
+  }
+
   if (allAvds.length === 0) {
     if (promptForNewDevice) {
       await promptConfirm(
@@ -389,64 +672,60 @@ async function bootAndroidEmulator({
   const preferredAvd = allAvds.find(a => !runningAvdNames.has(a)) ?? allAvds[0]!;
 
   const home = getAndroidHome();
-  const emulatorBin = run('which emulator') || resolve(home, 'emulator/emulator');
+  let emulatorBin = run('which emulator') || resolve(home, 'emulator/emulator');
+
+  if (!existsSync(emulatorBin)) {
+    log.info('Emulator binary not found, installing via sdkmanager...');
+    runLong(`${sdkManagerBin()} --install emulator`);
+    emulatorBin = resolve(home, 'emulator/emulator');
+  }
 
   const consolePort = pickEmulatorConsolePort(excludeSerials);
   const expectedSerial = `emulator-${consolePort}`;
 
-  // Use -read-only when reusing an AVD that is already running elsewhere.
   const needsReadOnly = runningAvdNames.has(preferredAvd);
-  const args = ['-avd', preferredAvd, '-no-audio', '-port', String(consolePort)];
-  if (needsReadOnly) args.push('-read-only');
+  const baseArgs = ['-avd', preferredAvd, '-no-audio', '-port', String(consolePort)];
+  if (needsReadOnly) baseArgs.push('-read-only');
+
   if (headless) {
-    args.push('-no-window', '-gpu', 'swiftshader_indirect');
+    baseArgs.push('-no-window', '-gpu', 'swiftshader_indirect', '-no-boot-anim');
+
+    const snapshot = hasAvdSnapshot(preferredAvd);
+
+    if (!snapshot) {
+      // ── First boot: cold boot → save snapshot → reboot read-only ──
+      log.info(`No snapshot found for ${preferredAvd} — performing warm-up boot...`);
+      const warmupArgs = [...baseArgs, '-no-snapshot-load'];
+      await spawnAndWaitForBoot(emulatorBin, warmupArgs, expectedSerial, 150); // 5 min timeout for cold boot
+      log.info('Warm-up boot complete, saving snapshot...');
+      await killEmulatorCleanly(expectedSerial);
+      writeFileSync(snapshotMarkerPath(preferredAvd), new Date().toISOString());
+      log.info('Snapshot saved. Rebooting from snapshot...');
+    } else {
+      log.info(`Snapshot found for ${preferredAvd} — fast boot.`);
+    }
+
+    // ── Production boot: load snapshot, never save back (read-only) ──
+    const prodArgs = [...baseArgs, '-no-snapshot-save'];
     log.info(`Booting emulator (headless): ${preferredAvd} on port ${consolePort}...`);
+    await spawnAndWaitForBoot(emulatorBin, prodArgs, expectedSerial, 150);
   } else {
     log.info(`Booting emulator: ${preferredAvd} on port ${consolePort}...`);
+    await spawnAndWaitForBoot(emulatorBin, baseArgs, expectedSerial);
   }
 
-  let emulatorStderr = '';
-  const emuProc = spawn(emulatorBin, args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
-  emuProc.stderr?.on('data', (chunk: Buffer) => {
-    emulatorStderr += chunk.toString();
-  });
-  emuProc.unref();
-  (emuProc.stderr as NodeJS.ReadableStream & { unref?: () => void })?.unref?.();
+  log.info(`Emulator is ready (${expectedSerial})`);
+  if (headless) disableAndroidAnimations(expectedSerial);
   poolBootedEmulator = true;
-
-  log.verbose(`Waiting for ${expectedSerial} to boot...`);
-
-  for (let i = 0; i < 90; i++) {
-    const online = getAndroidOnlineSerials();
-    if (online.includes(expectedSerial)) {
-      try {
-        const prop = run(`adb -s ${expectedSerial} shell getprop sys.boot_completed`);
-        if (prop === '1') {
-          log.info(`Emulator is ready (${expectedSerial})`);
-          _poolBootedAndroidSerial = expectedSerial;
-          return expectedSerial;
-        }
-      } catch {
-        /* device not ready yet */
-      }
-    }
-
-    if (emuProc.exitCode !== null) {
-      throw new Error(
-        `Emulator process exited with code ${emuProc.exitCode} before ${expectedSerial} came online.\n${emulatorStderr.slice(-500)}`,
-      );
-    }
-
-    await new Promise<void>(r => setTimeout(r, 2000));
-  }
-  throw new Error(`Emulator ${expectedSerial} did not finish booting in time.\n${emulatorStderr.slice(-500)}`);
+  _poolBootedAndroidSerial = expectedSerial;
+  return expectedSerial;
 }
 
 function setupAndroidPorts(wsPort: number, metroPort: number, deviceSerial?: string): void {
   const target = deviceSerial ? `-s ${deviceSerial} ` : '';
   try {
-    run(`adb ${target}reverse tcp:${wsPort} tcp:${wsPort}`);
-    run(`adb ${target}reverse tcp:${metroPort} tcp:${metroPort}`);
+    run(`${adb()} ${target}reverse tcp:${wsPort} tcp:${wsPort}`);
+    run(`${adb()} ${target}reverse tcp:${metroPort} tcp:${metroPort}`);
     log.verbose('ADB port reverse set up');
   } catch (e: unknown) {
     log.error('ADB reverse failed:', errorMessage(e));
@@ -470,7 +749,7 @@ function writeAndroidDebugHost(bundleId: string, metroPort: number, deviceSerial
       '</map>',
     ].join('\n');
     execSync(
-      `adb ${target}shell "run-as ${bundleId} sh -c 'mkdir -p shared_prefs && cat > shared_prefs/${bundleId}_preferences.xml'"`,
+      `${adb()} ${target}shell "run-as ${bundleId} sh -c 'mkdir -p shared_prefs && cat > shared_prefs/${bundleId}_preferences.xml'"`,
       { input: prefsXml, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
     log.verbose(`Set debug_http_host to localhost:${metroPort}`);
@@ -482,14 +761,12 @@ function writeAndroidDebugHost(bundleId: string, metroPort: number, deviceSerial
 function launchAndroidApp(bundleId: string, metroPort: number, deviceSerial?: string): void {
   const target = deviceSerial ? `-s ${deviceSerial} ` : '';
   log.verbose(`Launching ${bundleId}...`);
-  run(`adb ${target}shell am force-stop ${bundleId}`);
+  run(`${adb()} ${target}shell am force-stop ${bundleId}`);
   run('sleep 1');
 
   writeAndroidDebugHost(bundleId, metroPort, deviceSerial);
 
-  // Use LAUNCHER category to let Android resolve the main activity —
-  // the activity class name may differ from the applicationId.
-  execSync(`adb ${target}shell monkey -p ${bundleId} -c android.intent.category.LAUNCHER 1`, {
+  execSync(`${adb()} ${target}shell monkey -p ${bundleId} -c android.intent.category.LAUNCHER 1`, {
     encoding: 'utf8',
     stdio: 'pipe',
   });
@@ -499,7 +776,7 @@ function launchAndroidApp(bundleId: string, metroPort: number, deviceSerial?: st
 function stopAndroidApp(bundleId: string, deviceSerial?: string): void {
   const target = deviceSerial ? `-s ${deviceSerial} ` : '';
   try {
-    run(`adb ${target}shell am force-stop ${bundleId}`);
+    run(`${adb()} ${target}shell am force-stop ${bundleId}`);
   } catch {
     /* ignore */
   }
@@ -510,9 +787,9 @@ function shutdownAndroidEmulator(): void {
   log.verbose('Shutting down emulator...');
   try {
     if (_poolBootedAndroidSerial) {
-      run(`adb -s ${_poolBootedAndroidSerial} emu kill`);
+      run(`${adb()} -s ${_poolBootedAndroidSerial} emu kill`);
     } else {
-      run('adb emu kill');
+      run(`${adb()} emu kill`);
     }
   } catch {
     /* ignore */
@@ -620,12 +897,7 @@ function listIOSSimulatorsByPrefix(prefix: string): string[] {
   return ids;
 }
 
-async function maybeCreatePersistentIOSSimulator(instanceId?: string): Promise<string | null> {
-  const confirmed = await promptConfirm(
-    'No reusable iOS simulator is available. Create a new persistent simulator definition?',
-  );
-  if (!confirmed) return null;
-
+function createIOSSimulator(instanceId?: string): string {
   const deviceType = chooseIOSDeviceTypeIdentifier();
   const runtime = chooseIOSRuntimeIdentifier();
   if (!deviceType || !runtime) {
@@ -634,11 +906,20 @@ async function maybeCreatePersistentIOSSimulator(instanceId?: string): Promise<s
 
   const nameSuffix = (instanceId ?? Date.now().toString(36)).slice(-6);
   const name = `VitestMobile-${nameSuffix}`;
+  log.info(`Creating iOS simulator: ${name} (${deviceType}, ${runtime})`);
   const created = run(`xcrun simctl create "${name}" "${deviceType}" "${runtime}"`);
   if (!created) {
     throw new Error('Failed to create a new iOS simulator definition.');
   }
   return created.trim();
+}
+
+async function maybeCreatePersistentIOSSimulator(instanceId?: string): Promise<string | null> {
+  const confirmed = await promptConfirm(
+    'No reusable iOS simulator is available. Create a new persistent simulator definition?',
+  );
+  if (!confirmed) return null;
+  return createIOSSimulator(instanceId);
 }
 
 async function bootIOSSimulator(opts: {
@@ -668,7 +949,11 @@ async function bootIOSSimulator(opts: {
     if (opts.promptForNewDevice === false) {
       throw new Error('No available iOS simulators found and creating a new one is disabled.');
     }
-    simId = (await maybeCreatePersistentIOSSimulator(opts.instanceId)) ?? undefined;
+    if (opts.headless) {
+      simId = createIOSSimulator(opts.instanceId);
+    } else {
+      simId = (await maybeCreatePersistentIOSSimulator(opts.instanceId)) ?? undefined;
+    }
   }
   if (!simId) {
     throw new Error('No available iOS simulators found and simulator creation was declined.');
@@ -791,6 +1076,229 @@ function shutdownIOSSimulator(): void {
   _poolBootedSimUdid = null;
 }
 
+// ── Device Snapshots (iOS) ───────────────────────────────────────
+//
+// Save and restore the simulator's data directory so the app is
+// pre-installed on cache hit, eliminating the `simctl install` step.
+// Snapshots are keyed to the harness build cache key — when the
+// binary changes the snapshot is automatically stale.
+
+function simulatorDeviceDir(udid: string): string {
+  return join(homedir(), 'Library', 'Developer', 'CoreSimulator', 'Devices', udid);
+}
+
+function deviceSnapshotDir(cacheKey: string): string {
+  return resolve(getCacheDir(), 'device-snapshots', cacheKey);
+}
+
+/**
+ * Save the device's data directory after a successful install.
+ * The snapshot is keyed to `cacheKey` so it auto-invalidates when the
+ * harness binary changes. Only meaningful on iOS for now.
+ */
+export async function saveDeviceSnapshot(
+  platform: Platform,
+  cacheKey: string,
+  deviceId?: string,
+): Promise<string | null> {
+  if (platform !== 'ios') return null;
+
+  const udid = deviceId ?? getBootedSimulator();
+  if (!udid) {
+    log.warn('No booted iOS simulator — skipping snapshot save');
+    return null;
+  }
+
+  const snapDir = deviceSnapshotDir(cacheKey);
+  mkdirSync(snapDir, { recursive: true });
+
+  log.info(`Saving device snapshot (${cacheKey.slice(0, 12)}...)...`);
+
+  // Shut down so the data directory is consistent
+  const wasBooted = getBootedSimulators().some(s => s.udid === udid);
+  if (wasBooted) {
+    run(`xcrun simctl shutdown ${udid}`);
+    for (let i = 0; i < 15; i++) {
+      if (!getBootedSimulators().some(s => s.udid === udid)) break;
+      await new Promise<void>(r => setTimeout(r, 1000));
+    }
+  }
+
+  const dataDir = join(simulatorDeviceDir(udid), 'data');
+  const snapshotFile = join(snapDir, 'snapshot.tar');
+
+  if (!existsSync(dataDir)) {
+    log.warn(`Simulator data directory not found: ${dataDir}`);
+    return null;
+  }
+
+  execSync(`tar cf "${snapshotFile}" -C "${dataDir}" .`, {
+    stdio: 'pipe',
+    timeout: 120_000,
+  });
+
+  const runtimeInfo = chooseIOSRuntimeIdentifier();
+  writeFileSync(
+    join(snapDir, 'metadata.json'),
+    JSON.stringify({ udid, runtime: runtimeInfo, savedAt: new Date().toISOString() }),
+  );
+
+  // Reboot so the caller has a running device
+  if (wasBooted) {
+    run(`xcrun simctl boot ${udid}`);
+    for (let i = 0; i < 30; i++) {
+      if (getBootedSimulators().some(s => s.udid === udid)) break;
+      await new Promise<void>(r => setTimeout(r, 2000));
+    }
+  }
+
+  // Clean up snapshots for any *other* cache keys (stale builds)
+  cleanStaleSnapshots(cacheKey);
+
+  log.info('Device snapshot saved');
+  return snapshotFile;
+}
+
+/**
+ * Restore a device from a cached snapshot keyed to `cacheKey`.
+ * Creates a new simulator, injects the cached data, and boots it.
+ * Returns the device UDID or null if no matching snapshot exists.
+ */
+export async function restoreDeviceSnapshot(
+  platform: Platform,
+  cacheKey: string,
+  opts: { headless?: boolean } = {},
+): Promise<string | null> {
+  if (platform !== 'ios') return null;
+
+  const snapDir = deviceSnapshotDir(cacheKey);
+  const snapshotFile = join(snapDir, 'snapshot.tar');
+  const metadataFile = join(snapDir, 'metadata.json');
+
+  if (!existsSync(snapshotFile) || !existsSync(metadataFile)) {
+    log.verbose('No device snapshot for this cache key');
+    return null;
+  }
+
+  log.info(`Restoring device from snapshot (${cacheKey.slice(0, 12)}...)...`);
+
+  // Validate runtime hasn't changed since the snapshot was saved
+  const runtime = chooseIOSRuntimeIdentifier();
+  let metadata: { runtime?: string };
+  try {
+    metadata = JSON.parse(readFileSync(metadataFile, 'utf8'));
+  } catch {
+    log.warn('Corrupt snapshot metadata — discarding');
+    rmSync(snapDir, { recursive: true, force: true });
+    return null;
+  }
+
+  if (runtime && metadata.runtime && metadata.runtime !== runtime) {
+    log.warn(`Runtime changed (${metadata.runtime} → ${runtime}) — discarding snapshot`);
+    rmSync(snapDir, { recursive: true, force: true });
+    return null;
+  }
+
+  // Prefer an existing available (unbooted) simulator to avoid slow `simctl create`
+  // on CI runners where creating new devices can time out.
+  let udid = getFirstAvailableSimulator(getBootedSimulators().map(s => s.udid));
+  let createdNewSim = false;
+
+  if (udid) {
+    log.verbose(`Reusing existing simulator ${udid} for snapshot restore`);
+    run(`xcrun simctl shutdown ${udid}`);
+  } else {
+    const deviceType = chooseIOSDeviceTypeIdentifier();
+    if (!deviceType || !runtime) {
+      log.warn('Could not find compatible device type/runtime for snapshot restore');
+      return null;
+    }
+    log.verbose(`Creating snapshot simulator: deviceType=${deviceType} runtime=${runtime}`);
+    try {
+      udid =
+        execSync(`xcrun simctl create "VitestMobile-snapshot" "${deviceType}" "${runtime}"`, {
+          encoding: 'utf8',
+          stdio: 'pipe',
+          timeout: 60_000,
+        })?.trim() ?? null;
+    } catch (e: unknown) {
+      log.warn(`Failed to create simulator for snapshot restore: ${errorMessage(e)}`);
+      return null;
+    }
+    if (!udid) {
+      log.warn('simctl create returned empty UDID');
+      return null;
+    }
+    createdNewSim = true;
+  }
+
+  const dataDir = join(simulatorDeviceDir(udid), 'data');
+  try {
+    execSync(`tar xf "${snapshotFile}" -C "${dataDir}"`, {
+      stdio: 'pipe',
+      timeout: 120_000,
+    });
+  } catch (e: unknown) {
+    log.warn(`Failed to restore snapshot data: ${errorMessage(e)}`);
+    if (createdNewSim) {
+      try {
+        run(`xcrun simctl delete ${udid}`);
+      } catch {
+        /* ignore */
+      }
+    }
+    return null;
+  }
+
+  log.info(`Booting simulator from snapshot (${udid})...`);
+  run(`xcrun simctl boot ${udid}`);
+  poolBootedEmulator = true;
+  _poolBootedSimUdid = udid;
+
+  for (let i = 0; i < 30; i++) {
+    if (getBootedSimulators().some(s => s.udid === udid)) {
+      if (!opts.headless) openSimulatorApp();
+      log.info('Simulator restored from snapshot (app pre-installed)');
+      return udid;
+    }
+    await new Promise<void>(r => setTimeout(r, 2000));
+  }
+
+  log.warn('Snapshot-restored simulator did not boot in time');
+  if (createdNewSim) {
+    try {
+      run(`xcrun simctl delete ${udid}`);
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/**
+ * Check if a device snapshot exists for a given cache key.
+ */
+export function hasDeviceSnapshot(platform: Platform, cacheKey: string): boolean {
+  if (platform !== 'ios') return false;
+  const snapDir = deviceSnapshotDir(cacheKey);
+  return existsSync(join(snapDir, 'snapshot.tar')) && existsSync(join(snapDir, 'metadata.json'));
+}
+
+function cleanStaleSnapshots(currentKey: string): void {
+  const parentDir = resolve(getCacheDir(), 'device-snapshots');
+  if (!existsSync(parentDir)) return;
+  try {
+    const entries = execSync(`ls "${parentDir}"`, { encoding: 'utf8', stdio: 'pipe' }).trim().split('\n');
+    for (const entry of entries) {
+      if (entry && entry !== currentKey) {
+        rmSync(resolve(parentDir, entry), { recursive: true, force: true });
+      }
+    }
+  } catch {
+    /* best-effort cleanup */
+  }
+}
+
 // ── Public API ───────────────────────────────────────────────────
 
 export async function ensureDevice(
@@ -803,6 +1311,7 @@ export async function ensureDevice(
     headless = true,
     instanceId,
     promptForNewDevice = true,
+    apiLevel,
   }: DeviceOptions = {},
 ): Promise<string | undefined> {
   return withDeviceLock(async () => {
@@ -819,7 +1328,13 @@ export async function ensureDevice(
       }
 
       if (!selected) {
-        selected = await bootAndroidEmulator({ headless, bundleId, promptForNewDevice, excludeSerials: online });
+        selected = await bootAndroidEmulator({
+          headless,
+          bundleId,
+          promptForNewDevice,
+          excludeSerials: online,
+          apiLevel,
+        });
       } else {
         log.verbose(`Android device already running (${selected})`);
       }
@@ -835,6 +1350,33 @@ export async function ensureDevice(
     }
     return undefined;
   });
+}
+
+/**
+ * Read the VitestMobileCacheKey embedded in the installed app's metadata.
+ * Returns null if the app is not installed or the key is absent (e.g. older build).
+ */
+export function getInstalledCacheKey(platform: Platform, bundleId: string, deviceId?: string): string | null {
+  try {
+    if (platform === 'ios') {
+      const target = deviceId ?? 'booted';
+      const containerPath = run(`xcrun simctl get_app_container ${target} ${bundleId}`);
+      if (!containerPath) return null;
+      const value = run(`plutil -extract VitestMobileCacheKey raw "${resolve(containerPath, 'Info.plist')}"`);
+      return value || null;
+    }
+    if (platform === 'android') {
+      const adb = getAdbPath();
+      const target = deviceId ? `-s ${deviceId} ` : '';
+      const dump = run(`${adb} ${target}shell dumpsys package ${bundleId}`);
+      if (!dump) return null;
+      const match = dump.match(/vitest-mobile-cache-key.*?value=([^\s]+)/);
+      return match?.[1] ?? null;
+    }
+  } catch {
+    // Any failure means we can't confirm the installed version — caller should install.
+  }
+  return null;
 }
 
 export function launchApp(

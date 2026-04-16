@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "icon": "./app-icon.png",
+    "splash": {
+      "image": "./splash/splash-portrait.png",
+      "resizeMode": "cover",
+      "backgroundColor": "#121212"
+    },
+    "ios": {
+      "icon": "./ios/icon-1024.png"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./adaptive-icon.png",
+        "backgroundColor": "#1E1E1E"
+      }
+    }
+  }
+}

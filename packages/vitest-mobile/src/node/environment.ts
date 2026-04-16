@@ -5,11 +5,13 @@
  * checkEnvironment() aggregates all checks for a given platform.
  */
 
+import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import type { EnvironmentCheck, EnvironmentResult, NamedCheck, Platform } from './types';
-import { run, getAndroidHome } from './exec-utils';
+import { run, getAndroidHome, getAdbPath } from './exec-utils';
+import { getCacheDir } from './paths';
 
 interface SimctlListDevice {
   state?: string;
@@ -71,9 +73,22 @@ export function checkAndroidEmulator(): EnvironmentCheck {
 export function checkAndroidAVD(): EnvironmentCheck {
   const home = getAndroidHome();
   const emulatorBin = run('which emulator') || resolve(home, 'emulator/emulator');
-  const avds = run(`"${emulatorBin}" -list-avds`);
+  const avdHome = process.env.ANDROID_AVD_HOME || resolve(getCacheDir(), 'avd');
+  let avds: string | null = null;
+  try {
+    avds = (
+      execSync(`"${emulatorBin}" -list-avds`, {
+        encoding: 'utf8',
+        stdio: 'pipe',
+        timeout: 15_000,
+        env: { ...process.env, ANDROID_AVD_HOME: avdHome },
+      }) as string
+    ).trim();
+  } catch {
+    avds = null;
+  }
 
-  if (!avds || avds.trim().length === 0) {
+  if (!avds || avds.length === 0) {
     return {
       ok: false,
       message: 'No Android Virtual Devices (AVDs) found',
@@ -86,7 +101,7 @@ export function checkAndroidAVD(): EnvironmentCheck {
 }
 
 export function checkAndroidDevice(): EnvironmentCheck {
-  const output = run('adb devices');
+  const output = run(`${getAdbPath()} devices`);
   if (!output) return { ok: false, message: 'ADB not available' };
 
   const lines = output.split('\n').slice(1);

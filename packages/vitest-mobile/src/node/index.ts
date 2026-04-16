@@ -80,6 +80,7 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
     nativeModules: options.nativeModules,
     harnessApp: options.harnessApp,
     promptForNewDevice: options.promptForNewDevice ?? true,
+    bundle: options.bundle,
     mode,
   };
 
@@ -174,6 +175,9 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
           __native_run_end: true,
           reason,
         });
+        if (mode === 'run') {
+          _singletonWorker?.teardown();
+        }
       },
     });
     _reporterRegistered = true;

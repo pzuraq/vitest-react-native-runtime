@@ -29,6 +29,9 @@
     "./metro": {
       "require": "./dist/metro/withNativeTests.cjs",
       "default": "./dist/metro/withNativeTests.cjs"
+    },
+    "./test-registry": {
+      "types": "./test-registry.d.ts"
     }
   },
   "types": "matchers.d.ts",
@@ -37,12 +40,14 @@
     "vitest-mobile": "./bin/vitest-mobile.mjs"
   },
   "files": [
+    "assets/",
     "bin/",
     "dist/",
     "src/",
     "ios/",
     "android/",
-    "matchers.d.ts"
+    "matchers.d.ts",
+    "test-registry.d.ts"
   ],
   "scripts": {
     "build": "tsup",

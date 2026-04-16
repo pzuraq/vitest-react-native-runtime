@@ -2,6 +2,7 @@ import { execSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureDevice } from '../node/device';
+import { getAdbPath } from '../node/exec-utils';
 import { ensureHarnessBinary, detectReactNativeVersion } from '../node/harness-builder';
 import type { HarnessBuildResult } from '../node/harness-builder';
 
@@ -42,7 +43,7 @@ export async function install(platform: string, options: InstallOptions): Promis
   if (platform === 'ios') {
     execSync(`xcrun simctl install booted "${binaryPath}"`, { stdio: 'inherit' });
   } else {
-    execSync(`adb install -r "${binaryPath}"`, { stdio: 'inherit' });
+    execSync(`${getAdbPath()} install -r "${binaryPath}"`, { stdio: 'inherit' });
   }
 
   console.log(`\n${platform} harness app installed (${bundleId}).\n`);

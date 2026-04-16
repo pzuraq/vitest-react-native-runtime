@@ -1,6 +1,8 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { TouchableOpacity, StyleSheet, View, TextInput } from 'react-native';
+import { useTheme } from '@shopify/restyle';
 import { Text } from './atoms';
+import type { Theme } from './theme';
 import type { StatusFilter } from './types';
 
 const FILTERS: { key: StatusFilter; label: string }[] = [
@@ -16,6 +18,9 @@ interface FilterPillsProps {
 }
 
 export function FilterPills({ active, onChange }: FilterPillsProps) {
+  const { colors } = useTheme<Theme>();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+
   return (
     <View style={styles.row}>
       {FILTERS.map(f => (
@@ -39,12 +44,15 @@ interface SearchBarProps {
 }
 
 export function SearchBar({ value, onChangeText }: SearchBarProps) {
+  const { colors } = useTheme<Theme>();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+
   return (
     <View style={styles.searchContainer}>
       <TextInput
         style={styles.searchInput}
         placeholder="Filter tests..."
-        placeholderTextColor="#64748b"
+        placeholderTextColor={colors.textDim}
         value={value}
         onChangeText={onChangeText}
         autoCorrect={false}
@@ -54,44 +62,45 @@ export function SearchBar({ value, onChangeText }: SearchBarProps) {
   );
 }
 
-const styles = StyleSheet.create({
-  row: {
-    flexDirection: 'row',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    gap: 8,
-  },
-  pill: {
-    paddingHorizontal: 12,
-    paddingVertical: 5,
-    borderRadius: 12,
-    backgroundColor: '#334155',
-  },
-  pillActive: {
-    backgroundColor: '#60a5fa',
-  },
-  pillText: {
-    fontSize: 12,
-    color: '#94a3b8',
-  },
-  pillTextActive: {
-    color: '#ffffff',
-  },
-  searchContainer: {
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#334155',
-    backgroundColor: '#1e293b',
-  },
-  searchInput: {
-    backgroundColor: '#0f172a',
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    color: '#e2e8f0',
-    fontSize: 13,
-    borderWidth: 1,
-    borderColor: '#334155',
-  },
-});
+const createStyles = (colors: Theme['colors']) =>
+  StyleSheet.create({
+    row: {
+      flexDirection: 'row',
+      paddingHorizontal: 16,
+      paddingVertical: 8,
+      gap: 8,
+    },
+    pill: {
+      paddingHorizontal: 12,
+      paddingVertical: 5,
+      borderRadius: 12,
+      backgroundColor: colors.surfaceActive,
+    },
+    pillActive: {
+      backgroundColor: colors.accent,
+    },
+    pillText: {
+      fontSize: 12,
+      color: colors.textMuted,
+    },
+    pillTextActive: {
+      color: colors.white,
+    },
+    searchContainer: {
+      paddingHorizontal: 16,
+      paddingVertical: 8,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: colors.border,
+      backgroundColor: colors.surface,
+    },
+    searchInput: {
+      backgroundColor: colors.bg,
+      borderRadius: 8,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      color: colors.text,
+      fontSize: 13,
+      borderWidth: 1,
+      borderColor: colors.border,
+    },
+  });

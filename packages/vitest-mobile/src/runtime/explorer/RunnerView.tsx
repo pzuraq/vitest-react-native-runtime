@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Animated, View, StyleSheet, Dimensions } from 'react-native';
+import { useTheme } from '@shopify/restyle';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { SimpleBottomSheet, type SimpleBottomSheetRef } from './SimpleBottomSheet';
 import { TestContainer } from '../context';
@@ -23,28 +24,23 @@ import {
   collectTestNames,
   findNodeById,
 } from './tree-utils';
+import type { Theme } from './theme';
 import type { TestModule, TestTreeNode, ModuleStatus, StatusFilter } from './types';
 
 interface Props {
   modules: TestModule[];
 }
 
-/**
- * RunnerView is a pure observer of pool-driven test execution.
- * It subscribes to TestEvent from state.ts and updates the UI.
- * All test execution is driven by the pool (vitest).
- * Rerun requests are sent to the pool via sendToPool().
- */
 export function RunnerView({ modules }: Props) {
+  const { colors } = useTheme<Theme>();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const insets = useSafeAreaInsets();
   const allFiles = useMemo(() => modules.flatMap(m => m.files), [modules]);
 
-  // Tree state
   const [tree, setTree] = useState<TestTreeNode[]>(() => buildFileTree(allFiles));
   const treeRef = useRef(tree);
   treeRef.current = tree;
 
-  // Run state
   const [running, setRunning] = useState(false);
   const [passed, setPassed] = useState(0);
   const [failed, setFailed] = useState(0);
@@ -52,12 +48,10 @@ export function RunnerView({ modules }: Props) {
   const [completedFiles, setCompletedFiles] = useState(0);
   const [totalFiles, setTotalFiles] = useState(allFiles.length);
 
-  // Current test tracking for peek bar
   const [currentTestPath, setCurrentTestPath] = useState<string[]>(modules.map(m => m.name));
   const [currentTestName, setCurrentTestName] = useState<string | null>(null);
   const [currentStatus, setCurrentStatus] = useState<ModuleStatus>('pending');
 
-  // UI state
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [detailNode, setDetailNode] = useState<TestTreeNode | null>(null);
@@ -67,9 +61,6 @@ export function RunnerView({ modules }: Props) {
   const sheetRef = useRef<SimpleBottomSheetRef>(null);
   const snapPoints = useMemo(() => ['45%', '70%'], []);
 
-  // Scale the test container to fit above the sheet as it rises.
-  // The container keeps its full-screen layout size but is scaled down visually,
-  // with a translateY offset to anchor it below the safe area (status bar / island).
   const screenHeight = useMemo(() => Dimensions.get('window').height, []);
   const topInset = insets.top;
   const [sheetAnimatedHeight] = useState(() => new Animated.Value(0));
@@ -85,8 +76,6 @@ export function RunnerView({ modules }: Props) {
   const maxSheetPct = 0.7;
   const minScale = Math.max((screenHeight * (1 - maxSheetPct) - topInset) / usableHeight, 0.25);
 
-  // The peek height is the sheet's resting size (handle + status bar, ~150px).
-  // The viewport stays full-size until the sheet is dragged above this threshold.
   const peekThreshold = screenHeight * 0.18;
   const maxSheetHeight = screenHeight * maxSheetPct;
 
@@ -95,8 +84,6 @@ export function RunnerView({ modules }: Props) {
     outputRange: [1, 1, minScale],
     extrapolate: 'clamp',
   });
-
-  // No translateY needed — transformOrigin pins the scale to the top edge.
 
   useEffect(() => {
     return onStatusChange(status => {
@@ -110,10 +97,8 @@ export function RunnerView({ modules }: Props) {
     });
   }, []);
 
-  // Track display paths from file-start events
   const displayPathsRef = useRef(new Map<string, string>());
 
-  // Subscribe to pool-driven test events
   useEffect(() => {
     let currentFile = '';
 
@@ -198,7 +183,6 @@ export function RunnerView({ modules }: Props) {
     });
   }, [allFiles]);
 
-  // Detail view navigation
   const handleSelectNode = useCallback((node: TestTreeNode) => {
     setDetailNode(node);
     sheetRef.current?.snapToIndex(1);
@@ -246,7 +230,6 @@ export function RunnerView({ modules }: Props) {
     setDetailNode(child);
   }, []);
 
-  // Filtered tree
   const filteredTree = useMemo(() => {
     let result = tree;
     result = filterByStatus(result, statusFilter);
@@ -254,7 +237,6 @@ export function RunnerView({ modules }: Props) {
     return result;
   }, [tree, statusFilter, searchQuery]);
 
-  // Keep detail node in sync with tree updates
   const currentDetailNode = useMemo(() => {
     if (!detailNode) return null;
     return findNodeById(tree, detailNode.id) ?? detailNode;
@@ -341,14 +323,12 @@ export function RunnerView({ modules }: Props) {
               />
             ) : (
               <View style={styles.treeLayout}>
-                {/* Fixed header */}
                 <View style={styles.treeHeader}>
                   <Text style={styles.treeTitle}>Tests</Text>
                 </View>
 
                 <FilterPills active={statusFilter} onChange={setStatusFilter} />
 
-                {/* Scrollable test tree */}
                 <TestTree nodes={filteredTree} onSelectNode={handleSelectNode} />
 
                 {paused && (
@@ -360,7 +340,6 @@ export function RunnerView({ modules }: Props) {
                   </View>
                 )}
 
-                {/* Fixed at bottom */}
                 <SearchBar value={searchQuery} onChangeText={setSearchQuery} />
               </View>
             )}
@@ -375,78 +354,79 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-const styles = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: '#1e293b',
-  },
-  testContainerWrapper: {
-    flex: 1,
-    backgroundColor: '#ffffff',
-  },
-  disconnectedContainer: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 32,
-    paddingHorizontal: 24,
-  },
-  disconnectedDot: {
-    fontSize: 24,
-    color: '#64748b',
-    marginBottom: 8,
-  },
-  disconnectedTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#94a3b8',
-    marginBottom: 4,
-  },
-  disconnectedSubtitle: {
-    fontSize: 13,
-    color: '#64748b',
-  },
-  sheetBody: {
-    flex: 1,
-    overflow: 'hidden',
-  },
-  treeLayout: {
-    flex: 1,
-  },
-  treeHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#334155',
-  },
-  treeTitle: {
-    color: '#e2e8f0',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  pauseBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    backgroundColor: '#fbbf24',
-  },
-  pauseText: {
-    color: '#1a1a2e',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  continueButton: {
-    color: '#1a1a2e',
-    fontSize: 14,
-    fontWeight: '700',
-    backgroundColor: 'rgba(0,0,0,0.15)',
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    borderRadius: 6,
-    overflow: 'hidden',
-  },
-});
+const createStyles = (colors: Theme['colors']) =>
+  StyleSheet.create({
+    root: {
+      flex: 1,
+      backgroundColor: colors.surface,
+    },
+    testContainerWrapper: {
+      flex: 1,
+      backgroundColor: colors.testContainerBg,
+    },
+    disconnectedContainer: {
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingVertical: 32,
+      paddingHorizontal: 24,
+    },
+    disconnectedDot: {
+      fontSize: 24,
+      color: colors.textDim,
+      marginBottom: 8,
+    },
+    disconnectedTitle: {
+      fontSize: 16,
+      fontWeight: '600',
+      color: colors.textMuted,
+      marginBottom: 4,
+    },
+    disconnectedSubtitle: {
+      fontSize: 13,
+      color: colors.textDim,
+    },
+    sheetBody: {
+      flex: 1,
+      overflow: 'hidden',
+    },
+    treeLayout: {
+      flex: 1,
+    },
+    treeHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.border,
+    },
+    treeTitle: {
+      color: colors.text,
+      fontSize: 16,
+      fontWeight: '600',
+    },
+    pauseBar: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      backgroundColor: colors.warning,
+    },
+    pauseText: {
+      color: colors.black,
+      fontSize: 14,
+      fontWeight: '600',
+    },
+    continueButton: {
+      color: colors.black,
+      fontSize: 14,
+      fontWeight: '700',
+      backgroundColor: 'rgba(0,0,0,0.15)',
+      paddingHorizontal: 14,
+      paddingVertical: 6,
+      borderRadius: 6,
+      overflow: 'hidden',
+    },
+  });

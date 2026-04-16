@@ -37,7 +37,7 @@ jobs:
       - run: npm test
         working-directory: packages/vitest-mobile
 
-  # ── E2E: Android ───────────────────────────────────────────────────────────
+  # ── E2E: Android (cached) ──────────────────────────────────────────────────
   e2e-android:
     name: E2E (Android)
     runs-on: ubuntu-latest
@@ -58,20 +58,43 @@ jobs:
       - name: Build package
         run: npm run build --workspace=packages/vitest-mobile
 
-      - name: Build test harness app
-        run: npx vitest-mobile build android
+      - name: Compute cache key
+        id: cache-key
+        run: echo "key=android-e2e-$(npx vitest-mobile cache-key android)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/vitest-mobile
+            /usr/local/lib/android/sdk/system-images/android-35
+          key: ${{ steps.cache-key.outputs.key }}
+          restore-keys: android-e2e-
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build, boot & install
+        run: npx vitest-mobile bootstrap android --headless --api-level 35
+
+      - name: Pre-build JS bundle
+        run: npx vitest-mobile bundle --platform android
 
       - name: Run E2E tests
-        uses: ReactiveCircus/android-emulator-runner@v2
-        with:
-          api-level: 35
-          arch: x86_64
-          script: |
-            adb wait-for-device shell 'while [[ -z $(getprop sys.boot_completed) ]]; do sleep 1; done'
-            npx vitest-mobile install android
-            npx vitest run --project android
+        run: npx vitest run --project android
 
-  # ── E2E: iOS ───────────────────────────────────────────────────────────────
+      - name: Save cache
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/vitest-mobile
+            /usr/local/lib/android/sdk/system-images/android-35
+          key: ${{ steps.cache-key.outputs.key }}
+
+  # ── E2E: iOS (cached) ──────────────────────────────────────────────────────
   e2e-ios:
     name: E2E (iOS)
     runs-on: macos-latest
@@ -88,14 +111,91 @@ jobs:
       - name: Build package
         run: npm run build --workspace=packages/vitest-mobile
 
-      - name: Build test harness app
-        run: npx vitest-mobile build ios
+      - name: Compute cache key
+        id: cache-key
+        run: echo "key=ios-e2e-$(npx vitest-mobile cache-key ios)" >> "$GITHUB_OUTPUT"
 
-      - name: Boot simulator
-        run: npx vitest-mobile boot-device ios
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/vitest-mobile
+          key: ${{ steps.cache-key.outputs.key }}
+          restore-keys: ios-e2e-
 
-      - name: Install app on simulator
-        run: npx vitest-mobile install ios
+      - name: Build, boot & install
+        run: npx vitest-mobile bootstrap ios --headless
+
+      - name: Pre-build JS bundle
+        run: npx vitest-mobile bundle --platform ios
+
+      - name: Run E2E tests
+        run: npx vitest run --project ios
+
+      - name: Save cache
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/vitest-mobile
+          key: ${{ steps.cache-key.outputs.key }}
+
+  # ── E2E: Full build (no cache — runs on push to main only) ─────────────────
+  e2e-android-full:
+    name: E2E Full Build (Android)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build package
+        run: npm run build --workspace=packages/vitest-mobile
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build, boot & install
+        run: npx vitest-mobile bootstrap android --headless --force --api-level 35
+
+      - name: Pre-build JS bundle
+        run: npx vitest-mobile bundle --platform android
+
+      - name: Run E2E tests
+        run: npx vitest run --project android
+
+  e2e-ios-full:
+    name: E2E Full Build (iOS)
+    if: github.event_name == 'push'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build package
+        run: npm run build --workspace=packages/vitest-mobile
+
+      - name: Build, boot & install
+        run: npx vitest-mobile bootstrap ios --headless --force
+
+      - name: Pre-build JS bundle
+        run: npx vitest-mobile bundle --platform ios
 
       - name: Run E2E tests
         run: npx vitest run --project ios

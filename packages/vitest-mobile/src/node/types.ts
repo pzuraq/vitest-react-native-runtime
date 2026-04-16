@@ -25,6 +25,8 @@ export interface NativePoolOptions {
   harnessApp?: string;
   /** Prompt before creating persistent device definitions when needed. */
   promptForNewDevice?: boolean;
+  /** Use a pre-built JS bundle instead of Metro. Pass true for default path, or a path to the bundle directory. */
+  bundle?: boolean | string;
 }
 
 export interface NativePluginOptions {
@@ -57,6 +59,8 @@ export interface NativePluginOptions {
   metroPort?: number;
   /** Prompt before creating persistent simulator/emulator definitions when needed. */
   promptForNewDevice?: boolean;
+  /** Use a pre-built JS bundle instead of Metro. Pass true for default path, or a path to the bundle directory. */
+  bundle?: boolean | string;
 }
 
 export interface DeviceOptions {
@@ -68,6 +72,8 @@ export interface DeviceOptions {
   headless?: boolean;
   instanceId?: string;
   promptForNewDevice?: boolean;
+  /** Android API level for auto-provisioning a system image + AVD (e.g. 35). */
+  apiLevel?: number;
 }
 
 export interface EnvironmentCheck {

@@ -1,19 +1,21 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { ScrollView, TouchableOpacity, StyleSheet, View } from 'react-native';
+import { useTheme } from '@shopify/restyle';
 import { Text } from './atoms';
 import { MiniTree } from './TestTree';
 import { countByStatus, collectConsoleLogs } from './tree-utils';
 import { statusIcon, statusColor } from './status-utils';
+import type { Theme } from './theme';
 import type { TestTreeNode, ConsoleLogEntry } from './types';
 
-function logColor(level: ConsoleLogEntry['level']): string {
+function logColor(level: ConsoleLogEntry['level'], colors: Theme['colors']): string {
   switch (level) {
     case 'error':
-      return '#f87171';
+      return colors.fail;
     case 'warn':
-      return '#fbbf24';
+      return colors.warning;
     default:
-      return '#94a3b8';
+      return colors.textMuted;
   }
 }
 
@@ -36,6 +38,9 @@ export function TestDetailView({
   onStop,
   onDrillDown,
 }: TestDetailViewProps) {
+  const { colors } = useTheme<Theme>();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+
   const isGroup = node.type !== 'test';
   const counts = isGroup ? countByStatus(node) : null;
   const isRunning = running || node.status === 'running';
@@ -52,7 +57,6 @@ export function TestDetailView({
 
   return (
     <View style={styles.container}>
-      {/* Header */}
       <View style={styles.header}>
         <TouchableOpacity onPress={onBack} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
           <Text style={styles.backButton}>← Tests</Text>
@@ -69,10 +73,11 @@ export function TestDetailView({
       </View>
 
       <ScrollView style={styles.scrollContent} contentContainerStyle={styles.scrollContentInner}>
-        {/* Identity */}
         <View style={styles.identity}>
           <View style={styles.identityRow}>
-            <Text style={[styles.identityIcon, { color: statusColor(node.status) }]}>{statusIcon(node.status)}</Text>
+            <Text style={[styles.identityIcon, { color: statusColor(node.status, colors) }]}>
+              {statusIcon(node.status)}
+            </Text>
             <Text style={styles.identityName} numberOfLines={2}>
               {node.label}
             </Text>
@@ -93,7 +98,6 @@ export function TestDetailView({
           )}
         </View>
 
-        {/* Mini subtree for groups */}
         {isGroup && node.children.length > 0 && (
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Tests</Text>
@@ -101,7 +105,6 @@ export function TestDetailView({
           </View>
         )}
 
-        {/* Errors */}
         {!isGroup && node.error && (
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Error</Text>
@@ -124,7 +127,6 @@ export function TestDetailView({
           </View>
         )}
 
-        {/* Console */}
         {allConsoleLogs.length > 0 && (
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>
@@ -139,7 +141,7 @@ export function TestDetailView({
                       key={li}
                       style={[
                         styles.consoleEntry,
-                        { color: logColor(entry.level) },
+                        { color: logColor(entry.level, colors) },
                         isGroup && styles.consoleEntryIndented,
                       ]}
                     >
@@ -161,145 +163,146 @@ function hasFailedDescendant(node: TestTreeNode): boolean {
   return node.children.some(c => hasFailedDescendant(c));
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#334155',
-  },
-  backButton: {
-    color: '#60a5fa',
-    fontSize: 15,
-    fontWeight: '600',
-  },
-  rerunButton: {
-    backgroundColor: '#334155',
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    borderRadius: 6,
-  },
-  rerunText: {
-    color: '#60a5fa',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  stopButton: {
-    backgroundColor: '#f87171',
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    borderRadius: 6,
-  },
-  stopText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  scrollContent: {
-    flex: 1,
-  },
-  scrollContentInner: {
-    paddingBottom: 16,
-  },
-  identity: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#334155',
-  },
-  identityRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 8,
-  },
-  identityIcon: {
-    fontSize: 18,
-    fontWeight: '700',
-    marginTop: 1,
-  },
-  identityName: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#e2e8f0',
-    flex: 1,
-  },
-  breadcrumb: {
-    fontSize: 12,
-    color: '#64748b',
-    marginTop: 4,
-  },
-  identityMeta: {
-    marginTop: 4,
-  },
-  metaRunning: {
-    fontSize: 12,
-    color: '#fbbf24',
-  },
-  metaDuration: {
-    fontSize: 12,
-    color: '#64748b',
-  },
-  countsText: {
-    fontSize: 12,
-    color: '#94a3b8',
-    marginTop: 4,
-  },
-  section: {
-    paddingHorizontal: 16,
-    paddingTop: 16,
-  },
-  sectionTitle: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#94a3b8',
-    marginBottom: 8,
-  },
-  errorBlock: {
-    backgroundColor: 'rgba(248,113,113,0.1)',
-    borderRadius: 8,
-    padding: 12,
-    marginBottom: 8,
-  },
-  errorChildName: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#f87171',
-    marginBottom: 4,
-  },
-  errorText: {
-    fontSize: 12,
-    fontFamily: 'monospace',
-    color: '#f87171',
-  },
-  errorDrillHint: {
-    fontSize: 11,
-    color: '#64748b',
-    marginTop: 4,
-  },
-  consoleBlock: {
-    backgroundColor: '#0f172a',
-    borderRadius: 8,
-    padding: 12,
-  },
-  consoleGroupName: {
-    fontSize: 11,
-    color: '#64748b',
-    fontWeight: '600',
-    marginTop: 4,
-    marginBottom: 2,
-  },
-  consoleEntry: {
-    fontSize: 11,
-    fontFamily: 'monospace',
-    marginBottom: 2,
-  },
-  consoleEntryIndented: {
-    paddingLeft: 8,
-  },
-});
+const createStyles = (colors: Theme['colors']) =>
+  StyleSheet.create({
+    container: {
+      flex: 1,
+    },
+    header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.border,
+    },
+    backButton: {
+      color: colors.accent,
+      fontSize: 15,
+      fontWeight: '600',
+    },
+    rerunButton: {
+      backgroundColor: colors.surfaceActive,
+      paddingHorizontal: 14,
+      paddingVertical: 6,
+      borderRadius: 6,
+    },
+    rerunText: {
+      color: colors.accent,
+      fontSize: 13,
+      fontWeight: '600',
+    },
+    stopButton: {
+      backgroundColor: colors.fail,
+      paddingHorizontal: 14,
+      paddingVertical: 6,
+      borderRadius: 6,
+    },
+    stopText: {
+      color: colors.white,
+      fontSize: 13,
+      fontWeight: '600',
+    },
+    scrollContent: {
+      flex: 1,
+    },
+    scrollContentInner: {
+      paddingBottom: 16,
+    },
+    identity: {
+      paddingHorizontal: 16,
+      paddingVertical: 12,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.border,
+    },
+    identityRow: {
+      flexDirection: 'row',
+      alignItems: 'flex-start',
+      gap: 8,
+    },
+    identityIcon: {
+      fontSize: 18,
+      fontWeight: '700',
+      marginTop: 1,
+    },
+    identityName: {
+      fontSize: 16,
+      fontWeight: '600',
+      color: colors.text,
+      flex: 1,
+    },
+    breadcrumb: {
+      fontSize: 12,
+      color: colors.textDim,
+      marginTop: 4,
+    },
+    identityMeta: {
+      marginTop: 4,
+    },
+    metaRunning: {
+      fontSize: 12,
+      color: colors.warning,
+    },
+    metaDuration: {
+      fontSize: 12,
+      color: colors.textDim,
+    },
+    countsText: {
+      fontSize: 12,
+      color: colors.textMuted,
+      marginTop: 4,
+    },
+    section: {
+      paddingHorizontal: 16,
+      paddingTop: 16,
+    },
+    sectionTitle: {
+      fontSize: 13,
+      fontWeight: '600',
+      color: colors.textMuted,
+      marginBottom: 8,
+    },
+    errorBlock: {
+      backgroundColor: 'rgba(248,113,113,0.1)',
+      borderRadius: 8,
+      padding: 12,
+      marginBottom: 8,
+    },
+    errorChildName: {
+      fontSize: 13,
+      fontWeight: '600',
+      color: colors.fail,
+      marginBottom: 4,
+    },
+    errorText: {
+      fontSize: 12,
+      fontFamily: 'monospace',
+      color: colors.fail,
+    },
+    errorDrillHint: {
+      fontSize: 11,
+      color: colors.textDim,
+      marginTop: 4,
+    },
+    consoleBlock: {
+      backgroundColor: colors.bg,
+      borderRadius: 8,
+      padding: 12,
+    },
+    consoleGroupName: {
+      fontSize: 11,
+      color: colors.textDim,
+      fontWeight: '600',
+      marginTop: 4,
+      marginBottom: 2,
+    },
+    consoleEntry: {
+      fontSize: 11,
+      fontFamily: 'monospace',
+      marginBottom: 2,
+    },
+    consoleEntryIndented: {
+      paddingLeft: 8,
+    },
+  });

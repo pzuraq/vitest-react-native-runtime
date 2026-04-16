@@ -1,7 +1,9 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { TouchableOpacity, StyleSheet, View, ScrollView } from 'react-native';
+import { useTheme } from '@shopify/restyle';
 import { Text } from './atoms';
 import { statusIcon, statusColor } from './status-utils';
+import type { Theme } from './theme';
 import type { TestTreeNode } from './types';
 
 interface TreeRowProps {
@@ -13,12 +15,13 @@ interface TreeRowProps {
 }
 
 function TreeRow({ node, depth, expanded, onToggle, onDetail }: TreeRowProps) {
+  const { colors } = useTheme<Theme>();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const hasChildren = node.children.length > 0;
   const isLeaf = node.type === 'test';
 
   return (
     <View style={[styles.row, { paddingLeft: 16 + depth * 16 }]}>
-      {/* Chevron for groups — separate tap zone */}
       {!isLeaf ? (
         <TouchableOpacity
           onPress={onToggle}
@@ -31,9 +34,8 @@ function TreeRow({ node, depth, expanded, onToggle, onDetail }: TreeRowProps) {
         <View style={styles.chevronSpacer} />
       )}
 
-      {/* Row body — tap for detail view */}
       <TouchableOpacity onPress={onDetail} style={styles.rowBody}>
-        <Text style={[styles.statusIcon, { color: statusColor(node.status) }]}>{statusIcon(node.status)}</Text>
+        <Text style={[styles.statusIcon, { color: statusColor(node.status, colors) }]}>{statusIcon(node.status)}</Text>
         <Text numberOfLines={1} style={[styles.label, isLeaf && styles.labelLeaf]}>
           {node.label}
         </Text>
@@ -52,6 +54,8 @@ interface TestTreeProps {
 }
 
 export function TestTree({ nodes, onSelectNode, scrollable = true }: TestTreeProps) {
+  const { colors } = useTheme<Theme>();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
 
   const toggleNode = useCallback((id: string) => {
@@ -102,21 +106,22 @@ export function TestTree({ nodes, onSelectNode, scrollable = true }: TestTreePro
   );
 }
 
-/**
- * Mini tree used inside the detail view for groups.
- * Flat list of child tests with status — tappable to drill deeper.
- */
 interface MiniTreeProps {
   nodes: TestTreeNode[];
   onSelectNode: (node: TestTreeNode) => void;
 }
 
 export function MiniTree({ nodes, onSelectNode }: MiniTreeProps) {
+  const { colors } = useTheme<Theme>();
+  const styles = useMemo(() => createStyles(colors), [colors]);
+
   return (
     <View style={styles.miniContainer}>
       {nodes.map(node => (
         <TouchableOpacity key={node.id} onPress={() => onSelectNode(node)} style={styles.miniRow}>
-          <Text style={[styles.statusIcon, { color: statusColor(node.status) }]}>{statusIcon(node.status)}</Text>
+          <Text style={[styles.statusIcon, { color: statusColor(node.status, colors) }]}>
+            {statusIcon(node.status)}
+          </Text>
           <Text numberOfLines={1} style={styles.miniLabel}>
             {node.label}
           </Text>
@@ -131,87 +136,88 @@ export function MiniTree({ nodes, onSelectNode }: MiniTreeProps) {
   );
 }
 
-const styles = StyleSheet.create({
-  scrollView: {
-    flex: 1,
-  },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    minHeight: 40,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#334155',
-  },
-  chevronZone: {
-    width: 28,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  chevronSpacer: {
-    width: 28,
-  },
-  chevron: {
-    fontSize: 10,
-    color: '#64748b',
-  },
-  rowBody: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingRight: 16,
-    paddingVertical: 8,
-  },
-  statusIcon: {
-    width: 18,
-    fontSize: 13,
-    fontWeight: '700',
-    textAlign: 'center',
-  },
-  label: {
-    flex: 1,
-    fontSize: 13,
-    color: '#e2e8f0',
-    marginLeft: 6,
-  },
-  labelLeaf: {
-    fontWeight: '400',
-  },
-  duration: {
-    fontSize: 11,
-    color: '#64748b',
-    marginLeft: 8,
-  },
-  emptyContainer: {
-    padding: 24,
-    alignItems: 'center',
-  },
-  emptyText: {
-    fontSize: 13,
-    color: '#64748b',
-  },
-  miniContainer: {
-    backgroundColor: '#0f172a',
-    borderRadius: 8,
-    overflow: 'hidden',
-  },
-  miniRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#1e293b',
-  },
-  miniLabel: {
-    flex: 1,
-    fontSize: 12,
-    color: '#e2e8f0',
-    marginLeft: 6,
-  },
-  miniDuration: {
-    fontSize: 10,
-    color: '#64748b',
-    marginLeft: 8,
-  },
-});
+const createStyles = (colors: Theme['colors']) =>
+  StyleSheet.create({
+    scrollView: {
+      flex: 1,
+    },
+    row: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      minHeight: 40,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.border,
+    },
+    chevronZone: {
+      width: 28,
+      height: 40,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    chevronSpacer: {
+      width: 28,
+    },
+    chevron: {
+      fontSize: 10,
+      color: colors.textDim,
+    },
+    rowBody: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingRight: 16,
+      paddingVertical: 8,
+    },
+    statusIcon: {
+      width: 18,
+      fontSize: 13,
+      fontWeight: '700',
+      textAlign: 'center',
+    },
+    label: {
+      flex: 1,
+      fontSize: 13,
+      color: colors.text,
+      marginLeft: 6,
+    },
+    labelLeaf: {
+      fontWeight: '400',
+    },
+    duration: {
+      fontSize: 11,
+      color: colors.textDim,
+      marginLeft: 8,
+    },
+    emptyContainer: {
+      padding: 24,
+      alignItems: 'center',
+    },
+    emptyText: {
+      fontSize: 13,
+      color: colors.textDim,
+    },
+    miniContainer: {
+      backgroundColor: colors.bg,
+      borderRadius: 8,
+      overflow: 'hidden',
+    },
+    miniRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: colors.surface,
+    },
+    miniLabel: {
+      flex: 1,
+      fontSize: 12,
+      color: colors.text,
+      marginLeft: 6,
+    },
+    miniDuration: {
+      fontSize: 10,
+      color: colors.textDim,
+      marginLeft: 8,
+    },
+  });
