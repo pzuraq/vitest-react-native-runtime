@@ -76,6 +76,7 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
     harnessApp: options.harnessApp,
     promptForNewDevice: options.promptForNewDevice ?? true,
     bundle: options.bundle,
+    appConnectTimeout: options.appConnectTimeout,
     mode,
   };
 
@@ -165,13 +166,19 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
           testCount,
         });
       },
-      onTestRunEnd(_modules: unknown, _errors: unknown, reason: string) {
+      // Returning the promise is critical: Vitest awaits reporter hooks,
+      // and teardown() is the only place we close Metro (worker farm +
+      // file watchers) and the shared WS server. If we fire-and-forget
+      // here, Vitest hits its teardownTimeout before cleanup completes
+      // and prints "Tests closed successfully but something prevents
+      // the main process from exiting".
+      async onTestRunEnd(_modules: unknown, _errors: unknown, reason: string) {
         _singletonWorker?.sendToDevice({
           __native_run_end: true,
           reason,
         });
         if (mode === 'run') {
-          _singletonWorker?.teardown();
+          await _singletonWorker?.teardown();
         }
       },
     });
