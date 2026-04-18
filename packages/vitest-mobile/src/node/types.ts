@@ -28,6 +28,13 @@ export interface NativePoolOptions {
   promptForNewDevice?: boolean;
   /** Use a pre-built JS bundle instead of Metro. Pass true for default path, or a path to the bundle directory. */
   bundle?: boolean | string;
+  /**
+   * How long to wait (ms) for the harness app to connect back after it's
+   * launched. Covers app process start, Metro's initial bundle compile,
+   * Hermes parse, and JS init. Increase for cold Metro caches or large
+   * monorepos. Default: 180000 (3 minutes).
+   */
+  appConnectTimeout?: number;
 }
 
 export interface NativePluginOptions {
@@ -54,6 +61,13 @@ export interface NativePluginOptions {
   promptForNewDevice?: boolean;
   /** Use a pre-built JS bundle instead of Metro. Pass true for default path, or a path to the bundle directory. */
   bundle?: boolean | string;
+  /**
+   * How long to wait (ms) for the harness app to connect back after it's
+   * launched. Covers app process start, Metro's initial bundle compile,
+   * Hermes parse, and JS init. Increase for cold Metro caches or large
+   * monorepos. Default: 180000 (3 minutes).
+   */
+  appConnectTimeout?: number;
 }
 
 export interface DeviceOptions {

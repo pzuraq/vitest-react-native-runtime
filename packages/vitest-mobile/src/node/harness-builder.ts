@@ -42,6 +42,13 @@ export interface HarnessBuildResult {
   cached: boolean;
   /** Deterministic cache key derived from platform, RN version, native modules, and harness version. */
   cacheKey: string;
+  /**
+   * Absolute path to the scaffolded harness project directory
+   * (`<cache>/builds/<key>/project`). Used as the anchor for resolving
+   * `@react-native/metro-config` (and other RN-template-provided packages)
+   * when Metro boots.
+   */
+  projectDir: string;
 }
 
 const HARNESS_BUNDLE_ID = 'com.vitest.mobile.harness';
@@ -51,7 +58,10 @@ const DEFAULT_BUILD_TIMEOUT = 30 * 60 * 1000; // 30 minutes
 // Bump when the build customization changes in a way that invalidates cached
 // binaries (e.g. adding VitestMobileCacheKey to Info.plist / AndroidManifest).
 // v3: platform-independent cache key — scaffold+customize is shared, build is per-platform.
-const BUILD_FORMAT_VERSION = 3;
+// v4: merge scaffolded package.json (preserves RN template devDeps incl. @react-native/metro-config)
+//     + preserve node_modules in trimBuildCache + exports "./package.json" for TurboModule
+//     autolinking. Old binaries built pre-v4 are missing VitestMobileHarness registration.
+const BUILD_FORMAT_VERSION = 4;
 
 // ── Public API ─────────────────────────────────────────────────────
 
@@ -67,8 +77,9 @@ export function findHarnessBinary(
   const cacheKey = computeCacheKey(options);
   const buildDir = resolve(cacheDir, 'builds', cacheKey);
   const binaryPath = getBinaryPath(buildDir, options.platform);
+  const projectDir = resolve(buildDir, 'project');
   if (existsSync(binaryPath) && isBinaryValid(binaryPath, options.platform)) {
-    return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: true, cacheKey };
+    return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: true, cacheKey, projectDir };
   }
   return null;
 }
@@ -86,9 +97,10 @@ export async function ensureHarnessBinary(options: HarnessBuildOptions): Promise
 
   // Check cache — validate the binary is complete, not just the directory
   const binaryPath = getBinaryPath(buildDir, options.platform);
+  const projectDir = resolve(buildDir, 'project');
   if (existsSync(binaryPath) && isBinaryValid(binaryPath, options.platform)) {
     log.info(`Using cached harness binary: ${cacheKey.slice(0, 12)}...`);
-    return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: true, cacheKey };
+    return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: true, cacheKey, projectDir };
   }
 
   // File-based lock to prevent concurrent builds from parallel pool workers.
@@ -104,7 +116,7 @@ export async function ensureHarnessBinary(options: HarnessBuildOptions): Promise
       await new Promise<void>(r => setTimeout(r, 1000));
       if (existsSync(binaryPath)) {
         log.info('Harness binary ready (built by another worker).');
-        return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: true, cacheKey };
+        return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: true, cacheKey, projectDir };
       }
       if (!existsSync(lockPath)) break; // lock removed = build failed
     }
@@ -113,7 +125,6 @@ export async function ensureHarnessBinary(options: HarnessBuildOptions): Promise
 
   try {
     const buildStart = Date.now();
-    const projectDir = resolve(buildDir, 'project');
     const isProjectReady = existsSync(resolve(projectDir, '.vitest-mobile-customized'));
 
     if (!isProjectReady) {
@@ -142,7 +153,7 @@ export async function ensureHarnessBinary(options: HarnessBuildOptions): Promise
 
     const totalElapsed = ((Date.now() - buildStart) / 1000).toFixed(1);
     log.info(`Harness binary built and cached successfully (${totalElapsed}s total).`);
-    return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: false, cacheKey };
+    return { binaryPath, bundleId: HARNESS_BUNDLE_ID, cached: false, cacheKey, projectDir };
   } finally {
     // Remove lock so other workers (or future runs) don't hang
     try {
@@ -191,11 +202,20 @@ export function trimBuildCache(options: { platform: Platform }): {
     const projectDir = resolve(buildDir, 'project');
     if (!existsSync(projectDir)) continue;
 
+    // Note: we deliberately keep `project/node_modules` in the trim. Metro
+    // boots against the harness project to resolve @react-native/metro-config
+    // and the rest of the RN template's runtime dep closure; without those
+    // packages present, `npx vitest run` would fail to start after a trim.
+    //
+    // This does make the cache larger (~1.2 GB vs ~100 MB per key). In CI
+    // with content-addressed cache keys, that's fine: `actions/cache/save`
+    // is a no-op on an existing key, so only the first save after a
+    // cache-key-changing event pays the upload cost — which matches when
+    // we'd have rebuilt from scratch anyway.
+
     if (options.platform === 'ios') {
-      // Keep only: project/ios/DerivedData/Build/Products/Debug-iphonesimulator/*.app
-      // Remove: node_modules, Pods, DerivedData/Build/Intermediates.noindex, etc.
+      // Keep only: project/node_modules + project/ios/DerivedData/Build/Products/Debug-iphonesimulator/*.app
       const dirsToRemove = [
-        resolve(projectDir, 'node_modules'),
         resolve(projectDir, 'ios', 'Pods'),
         resolve(projectDir, 'ios', 'DerivedData', 'Build', 'Intermediates.noindex'),
         resolve(projectDir, 'ios', 'DerivedData', 'Logs'),
@@ -210,9 +230,8 @@ export function trimBuildCache(options: { platform: Platform }): {
         }
       }
     } else {
-      // Android: keep only the .apk
+      // Android: keep node_modules + the .apk
       const dirsToRemove = [
-        resolve(projectDir, 'node_modules'),
         resolve(projectDir, 'android', '.gradle'),
         resolve(projectDir, 'android', 'app', 'build', 'intermediates'),
         resolve(projectDir, 'android', 'app', 'build', 'tmp'),
@@ -402,33 +421,46 @@ function customizeProject(projectDir: string, options: HarnessBuildOptions, cach
   customizeIOS(projectDir, cacheKey);
   customizeAndroid(projectDir, cacheKey);
 
-  // 2. Write a minimal package.json (for npm install)
-  // Include vitest-mobile as a file: dep so autolinking
-  // picks up the VitestMobileHarness TurboModule via react-native.config.cjs.
-  const deps: Record<string, string> = {
-    react: readPeerVersion(options.projectRoot, 'react') ?? '19.1.0',
-    'react-native': options.reactNativeVersion,
-    'react-native-safe-area-context':
-      readInstalledVersion(options.projectRoot, 'react-native-safe-area-context') ?? '^5.0.0',
-    'vitest-mobile': `file:${options.packageRoot}`,
+  // 2. Merge our additions into the scaffolded package.json.
+  //
+  // `@react-native-community/cli init --version <RN>` already produced a
+  // package.json pinning react, react-native, and the full RN devDep set
+  // (@react-native/metro-config, @react-native/babel-preset, etc.) at the
+  // exact versions matching that RN release. Preserving those pins avoids
+  // version-tracking drift on our side — in particular, it guarantees
+  // @react-native/metro-config is present in the harness node_modules so
+  // Metro can resolve it from a known, deterministic location without
+  // depending on user-side hoisting.
+  //
+  // We only layer on the things the template can't know about:
+  //  - vitest-mobile as a file: dep (for TurboModule autolinking via
+  //    react-native.config.cjs)
+  //  - react-native-safe-area-context (used by our harness UI)
+  //  - any user-supplied native modules
+  const pkgPath = resolve(projectDir, 'package.json');
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
+    name?: string;
+    version?: string;
+    private?: boolean;
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+    [key: string]: unknown;
   };
-  const devDeps: Record<string, string> = {
-    '@react-native-community/cli': 'latest',
-    '@react-native-community/cli-platform-ios': 'latest',
-    '@react-native-community/cli-platform-android': 'latest',
-  };
-  for (const mod of options.nativeModules) {
-    deps[mod] = readInstalledVersion(options.projectRoot, mod) ?? '*';
-  }
 
-  const packageJson = {
-    name: HARNESS_APP_NAME.toLowerCase(),
-    version: '0.0.0',
-    private: true,
-    dependencies: deps,
-    devDependencies: devDeps,
-  };
-  writeFileSync(resolve(projectDir, 'package.json'), JSON.stringify(packageJson, null, 2));
+  pkg.name = HARNESS_APP_NAME.toLowerCase();
+  pkg.version = '0.0.0';
+  pkg.private = true;
+
+  const dependencies: Record<string, string> = { ...(pkg.dependencies ?? {}) };
+  dependencies['react-native-safe-area-context'] =
+    readInstalledVersion(options.projectRoot, 'react-native-safe-area-context') ?? '^5.0.0';
+  dependencies['vitest-mobile'] = `file:${options.packageRoot}`;
+  for (const mod of options.nativeModules) {
+    dependencies[mod] = readInstalledVersion(options.projectRoot, mod) ?? '*';
+  }
+  pkg.dependencies = dependencies;
+
+  writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
 
   // 3. Install dependencies
   log.info('Installing dependencies... (this may take a minute)');

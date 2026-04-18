@@ -39,14 +39,9 @@
   },
   "version": "1.0.0",
   "dependencies": {
-    "@react-native/babel-preset": "0.81.5",
-    "@react-native/metro-config": "0.81.5",
-    "@vitest/expect": "^4.1.4",
-    "@vitest/runner": "^4.1.4",
-    "@vitest/utils": "^4.1.4",
-    "chai": "^6.2.2",
     "react": "19.1.0",
     "react-native": "0.81.5",
     "react-native-safe-area-context": "^5.7.0"
-  }
+  },
+  "packageManager": "npm@11.12.1"
 }

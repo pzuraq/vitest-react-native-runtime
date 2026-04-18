@@ -143,6 +143,7 @@ export function createNativePoolWorker(options: NativePoolOptions) {
   const mode = options.mode ?? 'run';
   const headless = options.headless ?? mode === 'run';
   const promptForNewDevice = options.promptForNewDevice ?? true;
+  const appConnectTimeout = options.appConnectTimeout ?? 180_000;
 
   const appDir = options.appDir ?? process.cwd();
   let outputDir = resolve(appDir, '.vitest-mobile');
@@ -185,6 +186,7 @@ export function createNativePoolWorker(options: NativePoolOptions) {
   let _startPromise: Promise<void> | null = null;
   let _startComplete = false;
   let _metroRunner: MetroRunnerServer | null = null;
+  let _harnessProjectDir: string | undefined;
   let _rerunCallback: ((files: string[], pattern?: string) => void) | null = null;
   const _lastRunMessages = new Map<string, BiRpcMessage>();
   const _registryToAbsPath = new Map<string, string>();
@@ -192,7 +194,7 @@ export function createNativePoolWorker(options: NativePoolOptions) {
   let _instanceRegistered = false;
   let _startConfigSent = false;
 
-  function waitForApp(timeoutMs = 30000): Promise<void> {
+  function waitForApp(timeoutMs = appConnectTimeout): Promise<void> {
     return new Promise((resolvePromise, reject) => {
       if (_connectedSocket) {
         resolvePromise();
@@ -268,6 +270,7 @@ export function createNativePoolWorker(options: NativePoolOptions) {
       appModuleName: 'VitestMobileApp',
       outputDir,
       wsPort: port,
+      harnessProjectDir: _harnessProjectDir,
     });
   }
 
@@ -585,6 +588,7 @@ export function createNativePoolWorker(options: NativePoolOptions) {
       bundleId = harnessResult.bundleId;
       binaryPath = harnessResult.binaryPath;
       harnessCacheKey = harnessResult.cacheKey;
+      _harnessProjectDir = harnessResult.projectDir;
       log.info(`Using cached harness binary: ${harnessResult.binaryPath.split('/').pop()?.slice(0, 12)}...`);
     }
 
@@ -703,7 +707,7 @@ export function createNativePoolWorker(options: NativePoolOptions) {
           });
           await launchWithRetry();
         }
-        await waitForApp(30000);
+        await waitForApp(appConnectTimeout);
       }
     }
   }

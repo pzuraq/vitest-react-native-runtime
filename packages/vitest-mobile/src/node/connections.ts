@@ -62,8 +62,11 @@ export function closeServer(): Promise<void> {
       }
     }
     wss.close(() => resolve());
-    // Safety timeout — don't block shutdown forever
-    setTimeout(resolve, 1000);
+    // Safety timeout — don't block shutdown forever. Unref so it can't
+    // hold the event loop open on its own if wss.close() has already
+    // resolved the promise.
+    const t = setTimeout(resolve, 1000);
+    (t as unknown as { unref(): void }).unref();
   });
 }
 
