@@ -69,7 +69,7 @@ Bootstrap the test harness app and run the tests:
 
 ```bash
 # Generate, build, and install the test harness app (~5 min first build)
-npx vitest-mobile bootstrap ios
+npx vitest-mobile bootstrap --platform ios
 
 # Run tests
 npx vitest run --project ios
@@ -79,7 +79,7 @@ For Android:
 
 ```bash
 # Generate, build, and install the test harness app (~5 min first build)
-npx vitest-mobile bootstrap android
+npx vitest-mobile bootstrap --platform android
 npx vitest run --project android
 ```
 
@@ -172,19 +172,19 @@ All commands are run via `npx vitest-mobile <command>`.
 
 ```bash
 # Boot a simulator / emulator
-npx vitest-mobile boot-device ios
-npx vitest-mobile boot-device android
+npx vitest-mobile boot-device --platform ios
+npx vitest-mobile boot-device --platform android
 
 # Build the native harness binary (~5 min first time, cached after)
-npx vitest-mobile build ios
-npx vitest-mobile build android
+npx vitest-mobile build --platform ios
+npx vitest-mobile build --platform android
 
 # Install the built binary onto the device
-npx vitest-mobile install ios
+npx vitest-mobile install --platform ios
 
 # Build + install in one step
-npx vitest-mobile bootstrap ios
-npx vitest-mobile bootstrap android --headless --api-level 35
+npx vitest-mobile bootstrap --platform ios
+npx vitest-mobile bootstrap --platform android --headless --api-level 35
 ```
 
 ### Debugging & Inspection
@@ -258,7 +258,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       # Build native binary, boot emulator, install app
-      - run: npx vitest-mobile bootstrap android --headless --api-level 35
+      - run: npx vitest-mobile bootstrap --platform android --headless --api-level 35
 
       # Pre-build the JS bundle for faster test startup
       - run: npx vitest-mobile bundle --platform android
@@ -284,7 +284,7 @@ jobs:
           cache: npm
 
       - run: npm ci
-      - run: npx vitest-mobile bootstrap ios --headless
+      - run: npx vitest-mobile bootstrap --platform ios --headless
       - run: npx vitest-mobile bundle --platform ios
       - run: npx vitest run --project ios
 ```
@@ -296,7 +296,7 @@ To avoid rebuilding the native binary on every CI run, cache the `~/.cache/vites
 ```yaml
 - name: Compute cache key
   id: cache-key
-  run: echo "key=android-e2e-$(npx vitest-mobile cache-key android)" >> "$GITHUB_OUTPUT"
+  run: echo "key=android-e2e-$(npx vitest-mobile cache-key --platform android)" >> "$GITHUB_OUTPUT"
 
 - uses: actions/cache/restore@v4
   with:
@@ -351,7 +351,7 @@ xcrun simctl launch booted com.vitest.mobile.harness --initialUrl "http://127.0.
 Rebuild the native binary:
 
 ```bash
-npx vitest-mobile bootstrap ios
+npx vitest-mobile bootstrap --platform ios
 ```
 
 ### Process hanging after tests complete

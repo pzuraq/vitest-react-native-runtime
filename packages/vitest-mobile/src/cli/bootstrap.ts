@@ -1,10 +1,12 @@
-import { execSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureDevice, saveDeviceSnapshot, restoreDeviceSnapshot, getInstalledCacheKey } from '../node/device';
 import { getAdbPath } from '../node/exec-utils';
 import { ensureHarnessBinary, detectReactNativeVersion, trimBuildCache } from '../node/harness-builder';
+import { getLogSink } from '../node/logger';
 import type { Platform } from '../node/types';
+import { updateStatus } from './ui';
+import { teeExec } from './exec-tee';
 
 const packageRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
 
@@ -13,6 +15,8 @@ export interface BootstrapOptions {
   force: boolean;
   headless: boolean;
   apiLevel?: number;
+  /** Additional react-native native modules to link into the harness binary. */
+  nativeModules?: string[];
 }
 
 /**
@@ -42,9 +46,12 @@ export async function bootstrap(platform: string, options: BootstrapOptions): Pr
     );
   }
 
-  console.log(`\nBuilding ${platform} harness binary...`);
-  console.log(`  React Native: ${rnVersion}`);
-  console.log(`  App dir: ${appDir}\n`);
+  const spinnerActive = !!getLogSink();
+  if (!spinnerActive) {
+    console.log(`\nBuilding ${platform} harness binary...`);
+    console.log(`  React Native: ${rnVersion}`);
+    console.log(`  App dir: ${appDir}\n`);
+  }
 
   if (options.force) {
     const { rmSync } = await import('node:fs');
@@ -56,72 +63,93 @@ export async function bootstrap(platform: string, options: BootstrapOptions): Pr
     }
   }
 
+  updateStatus(`Building ${platform} harness binary (RN ${rnVersion})…`);
   const result = await ensureHarnessBinary({
     platform: p,
     reactNativeVersion: rnVersion,
-    nativeModules: [],
+    nativeModules: options.nativeModules ?? [],
     packageRoot,
     projectRoot: appDir,
   });
 
-  if (result.cached) {
-    console.log(`Using cached binary (${result.binaryPath})`);
-  } else {
-    console.log(`Binary built: ${result.binaryPath}`);
+  if (!spinnerActive) {
+    if (result.cached) {
+      console.log(`Using cached binary (${result.binaryPath})`);
+    } else {
+      console.log(`Binary built: ${result.binaryPath}`);
+    }
+    console.log(`\n${platform} build complete.\n`);
   }
-  console.log(`\n${platform} build complete.\n`);
 
   // ── 2. Device: snapshot restore or fresh boot + install ────────
   const bundleId = result.bundleId;
 
   if (options.headless) {
     // Try snapshot restore first (keyed to the build hash)
+    updateStatus(`Restoring ${platform} device snapshot…`);
     const restored = await restoreDeviceSnapshot(p, result.cacheKey, {
       headless: true,
+      appDir,
     });
 
-    if (!restored) {
-      await ensureDevice(p, {
+    if (!restored) updateStatus(`Booting ${platform} device…`);
+    const deviceId =
+      restored ??
+      (await ensureDevice(p, {
         headless: true,
         apiLevel: options.apiLevel,
-      });
-    }
+        appDir,
+      }));
 
-    const didInstall = installIfNeeded(p, bundleId, result.binaryPath, result.cacheKey);
+    const didInstall = installIfNeeded(p, bundleId, result.binaryPath, result.cacheKey, deviceId);
 
     if (!restored || didInstall) {
-      await saveDeviceSnapshot(p, result.cacheKey);
+      updateStatus(`Saving ${platform} device snapshot…`);
+      await saveDeviceSnapshot(p, result.cacheKey, deviceId);
     }
 
     // Trim intermediate build artifacts so the CI cache stays small
+    updateStatus(`Trimming build cache…`);
     trimBuildCache({ platform: p });
   } else {
     // Local / interactive: plain boot + install, no snapshots
-    await ensureDevice(p, {
+    updateStatus(`Booting ${platform} device…`);
+    const deviceId = await ensureDevice(p, {
       headless: false,
       apiLevel: options.apiLevel,
+      appDir,
     });
 
-    installIfNeeded(p, bundleId, result.binaryPath, result.cacheKey);
+    installIfNeeded(p, bundleId, result.binaryPath, result.cacheKey, deviceId);
   }
 
-  console.log(`\n${platform} device ready with app installed.\n`);
+  if (!spinnerActive) {
+    console.log(`\n${platform} device ready with app installed.\n`);
+  }
 }
 
 /** @returns true if the binary was actually installed, false if skipped. */
-function installIfNeeded(platform: Platform, bundleId: string, binaryPath: string, cacheKey: string): boolean {
-  const installedKey = getInstalledCacheKey(platform, bundleId);
+function installIfNeeded(
+  platform: Platform,
+  bundleId: string,
+  binaryPath: string,
+  cacheKey: string,
+  deviceId?: string,
+): boolean {
+  const installedKey = getInstalledCacheKey(platform, bundleId, deviceId);
   if (installedKey === cacheKey) {
-    console.log('\nHarness binary already installed — skipping install\n');
+    updateStatus(`Harness binary already installed — skipping`);
     return false;
   }
 
-  console.log(`\nInstalling ${binaryPath}...\n`);
+  updateStatus(`Installing ${platform} harness binary…`);
 
   if (platform === 'ios') {
-    execSync(`xcrun simctl install booted "${binaryPath}"`, { stdio: 'inherit' });
+    const target = deviceId ?? 'booted';
+    teeExec(`xcrun simctl install ${target} "${binaryPath}"`);
   } else {
-    execSync(`${getAdbPath()} install -r "${binaryPath}"`, { stdio: 'inherit' });
+    const target = deviceId ? `-s ${deviceId} ` : '';
+    teeExec(`${getAdbPath()} ${target}install -r "${binaryPath}"`);
   }
   return true;
 }

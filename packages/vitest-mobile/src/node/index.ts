@@ -15,6 +15,14 @@ import type { NativePluginOptions, NativePoolOptions, PoolMode } from './types';
 
 const DEFAULT_INCLUDE = ['**/native-tests/**/*.test.tsx', '**/native-tests/**/*.test.ts'];
 
+/**
+ * Key under which nativePlugin stashes the original user-supplied options on
+ * the returned Plugin object. Not part of the public API — intended for the
+ * vitest-mobile CLI to read back options (currently `nativeModules`) from a
+ * statically-loaded vitest config.
+ */
+export const VITEST_MOBILE_PLUGIN_OPTIONS_KEY = '__vitestMobileOptions';
+
 function detectMode(): PoolMode {
   if (process.env.CI) return 'run';
   if (process.argv.includes('run')) return 'run';
@@ -77,6 +85,7 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
     promptForNewDevice: options.promptForNewDevice ?? true,
     bundle: options.bundle,
     appConnectTimeout: options.appConnectTimeout,
+    metro: options.metro,
     mode,
   };
 
@@ -123,6 +132,11 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
   // not present in Vite's Plugin type definition.
   const plugin: Plugin & Record<string, unknown> = {
     name: 'vitest-mobile',
+    // Expose the original user-supplied options so the CLI can read them
+    // back from a loaded vitest config (bootstrap/build/install/bundle use
+    // this to default `nativeModules` without requiring users to repeat
+    // themselves with --native-modules on the command line).
+    [VITEST_MOBILE_PLUGIN_OPTIONS_KEY]: options,
     config(config: UserConfig) {
       const test = ((config as Record<string, unknown>).test as Record<string, unknown> | undefined) ?? {};
       (config as Record<string, unknown>).test = test;
@@ -188,4 +202,10 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
   return plugin;
 }
 
-export type { NativePluginOptions, NativePoolOptions, Platform } from './types';
+export type {
+  NativePluginOptions,
+  NativePoolOptions,
+  Platform,
+  MetroConfigContext,
+  MetroConfigCustomizer,
+} from './types';

@@ -1,10 +1,11 @@
-import { execSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureDevice } from '../node/device';
 import { getAdbPath } from '../node/exec-utils';
 import { ensureHarnessBinary, detectReactNativeVersion } from '../node/harness-builder';
 import type { HarnessBuildResult } from '../node/harness-builder';
+import { updateStatus } from './ui';
+import { teeExec } from './exec-tee';
 
 const packageRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
 
@@ -12,6 +13,8 @@ export interface InstallOptions {
   appDir: string;
   /** Pre-built result from build command (skips rebuild). */
   buildResult?: HarnessBuildResult;
+  /** Additional react-native native modules to link into the harness binary. */
+  nativeModules?: string[];
 }
 
 export async function install(platform: string, options: InstallOptions): Promise<void> {
@@ -36,7 +39,7 @@ export async function install(platform: string, options: InstallOptions): Promis
     const result = await ensureHarnessBinary({
       platform: platform as 'ios' | 'android',
       reactNativeVersion: rnVersion,
-      nativeModules: [],
+      nativeModules: options.nativeModules ?? [],
       packageRoot,
       projectRoot: appDir,
     });
@@ -44,15 +47,15 @@ export async function install(platform: string, options: InstallOptions): Promis
     bundleId = result.bundleId;
   }
 
-  await ensureDevice(platform as 'ios' | 'android', { headless: false });
+  updateStatus(`Booting ${platform} device…`);
+  await ensureDevice(platform as 'ios' | 'android', { headless: false, appDir });
 
-  console.log(`\nInstalling ${binaryPath}...\n`);
-
+  updateStatus(`Installing ${platform} harness binary…`);
   if (platform === 'ios') {
-    execSync(`xcrun simctl install booted "${binaryPath}"`, { stdio: 'inherit' });
+    teeExec(`xcrun simctl install booted "${binaryPath}"`);
   } else {
-    execSync(`${getAdbPath()} install -r "${binaryPath}"`, { stdio: 'inherit' });
+    teeExec(`${getAdbPath()} install -r "${binaryPath}"`);
   }
 
-  console.log(`\n${platform} harness app installed (${bundleId}).\n`);
+  updateStatus(`${platform} harness app installed (${bundleId}).`);
 }

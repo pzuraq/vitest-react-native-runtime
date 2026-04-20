@@ -271,6 +271,7 @@ export function createNativePoolWorker(options: NativePoolOptions) {
       outputDir,
       wsPort: port,
       harnessProjectDir: _harnessProjectDir,
+      metro: options.metro,
     });
   }
 
@@ -604,6 +605,7 @@ export function createNativePoolWorker(options: NativePoolOptions) {
       headless,
       instanceId,
       promptForNewDevice,
+      appDir,
     });
     if (selectedDevice) {
       deviceId = selectedDevice;
@@ -676,6 +678,7 @@ export function createNativePoolWorker(options: NativePoolOptions) {
               headless,
               instanceId,
               promptForNewDevice,
+              appDir,
             });
             if (selected) {
               deviceId = selected;
@@ -747,17 +750,27 @@ export function createNativePoolWorker(options: NativePoolOptions) {
 
     async start(): Promise<void> {
       if (!_startPromise) {
-        _startPromise = doStart().then(() => {
-          _startComplete = true;
-        });
+        // Every server/timer in this pool is unref'd so the harness doesn't
+        // wedge shutdown after a run. That means once start() resolves, Node
+        // has no event-loop holders of its own — if we awaited _startPromise
+        // the process would exit cleanly before any test fired. Hold the
+        // loop open ourselves with a ref'd heartbeat interval that runs for
+        // the duration of device bring-up and is cleared when we're ready.
+        const keepAlive = setInterval(() => {}, 30_000);
+        _startPromise = doStart()
+          .then(() => {
+            _startComplete = true;
+          })
+          .finally(() => clearInterval(keepAlive));
         _startPromise.catch(e => log.error('Startup failed:', e));
       }
-      // Block until device startup completes. This keeps Node.js alive
-      // (all our servers/timers are unref'd) and fits within vitest's
-      // WORKER_START_TIMEOUT (90s). The separate 'start' message handler
-      // responds with 'started' immediately so START_TIMEOUT (60s) is
-      // never hit — it only begins after this method returns.
-      await _startPromise;
+      // Return immediately — do NOT await _startPromise. Device bring-up
+      // (simctl boot, install, app launch, bundle load, WS handshake) can
+      // take much longer than vitest's WORKER_START_TIMEOUT (90s), especially
+      // on a cold-boot iOS 26+ simulator. The `send()` handlers defer
+      // 'collect' and 'run' until `_startComplete`, so we don't need start()
+      // to block the worker lifecycle — clearing vitest's internal timeout
+      // via a quick resolution is enough.
     },
 
     async stop(): Promise<void> {

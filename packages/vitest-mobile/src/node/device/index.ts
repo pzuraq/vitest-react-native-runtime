@@ -10,8 +10,16 @@ import {
   restoreDeviceSnapshot as iosRestoreDeviceSnapshot,
   listAutoCreatedDeviceIds as iosListAutoCreatedDeviceIds,
   cleanupAutoCreatedDevices as iosCleanupAutoCreatedDevices,
+  listProjectDeviceIds as iosListProjectDeviceIds,
+  cleanupProjectDevices as iosCleanupProjectDevices,
 } from './ios';
-import { androidDriver } from './android';
+import {
+  androidDriver,
+  listAutoCreatedAvds,
+  cleanupAutoCreatedAvds,
+  listProjectAvds,
+  cleanupProjectAvds,
+} from './android';
 
 // ── DeviceDriver interface ───────────────────────────────────────
 
@@ -64,20 +72,33 @@ export async function saveDeviceSnapshot(
 export async function restoreDeviceSnapshot(
   platform: Platform,
   cacheKey: string,
-  opts: { headless?: boolean } = {},
+  opts: { headless?: boolean; appDir?: string } = {},
 ): Promise<string | null> {
   if (platform !== 'ios') return null;
   return iosRestoreDeviceSnapshot(cacheKey, opts);
 }
 
 export function listAutoCreatedDeviceIds(platform: Platform): string[] {
-  if (platform !== 'ios') return [];
-  return iosListAutoCreatedDeviceIds();
+  return platform === 'ios' ? iosListAutoCreatedDeviceIds() : listAutoCreatedAvds();
 }
 
-export function cleanupAutoCreatedDevices(platform: Platform): string[] {
-  if (platform !== 'ios') return [];
-  return iosCleanupAutoCreatedDevices();
+/**
+ * Shutdown and delete every auto-created device for the platform.
+ * Android cleanup is async (needs to kill running emulators cleanly first);
+ * iOS is sync but wrapped here for a uniform async API.
+ */
+export async function cleanupAutoCreatedDevices(platform: Platform): Promise<string[]> {
+  return platform === 'ios' ? iosCleanupAutoCreatedDevices() : cleanupAutoCreatedAvds();
+}
+
+/** List devices belonging to the given project. */
+export function listProjectDeviceIds(platform: Platform, appDir: string): string[] {
+  return platform === 'ios' ? iosListProjectDeviceIds(appDir) : listProjectAvds(appDir);
+}
+
+/** Shutdown and delete the given project's device(s). */
+export async function cleanupProjectDevices(platform: Platform, appDir: string): Promise<string[]> {
+  return platform === 'ios' ? iosCleanupProjectDevices(appDir) : cleanupProjectAvds(appDir);
 }
 
 // Re-export shared utilities used by other modules

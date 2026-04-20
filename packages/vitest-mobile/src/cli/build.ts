@@ -2,14 +2,16 @@ import { resolve } from 'node:path';
 import { rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ensureHarnessBinary, detectReactNativeVersion } from '../node/harness-builder';
+import { getLogSink } from '../node/logger';
 import { getCacheDir } from '../node/paths';
 import type { HarnessBuildResult } from '../node/harness-builder';
+import { updateStatus } from './ui';
 
 const packageRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
 
 export async function build(
   platform: string,
-  options: { appDir: string; force: boolean },
+  options: { appDir: string; force: boolean; nativeModules?: string[] },
 ): Promise<HarnessBuildResult> {
   const appDir = resolve(process.cwd(), options.appDir);
 
@@ -23,13 +25,16 @@ export async function build(
     );
   }
 
-  console.log(`\nBuilding ${platform} harness binary...`);
-  console.log(`  React Native: ${rnVersion}`);
-  console.log(`  App dir: ${appDir}\n`);
+  const spinnerActive = !!getLogSink();
+  if (!spinnerActive) {
+    console.log(`\nBuilding ${platform} harness binary...`);
+    console.log(`  React Native: ${rnVersion}`);
+    console.log(`  App dir: ${appDir}\n`);
+  }
 
   if (options.force) {
     const cacheDir = getCacheDir();
-    console.log('  --force: clearing build cache...');
+    updateStatus('--force: clearing build cache…');
     try {
       rmSync(resolve(cacheDir, 'builds'), { recursive: true, force: true });
     } catch {
@@ -37,20 +42,22 @@ export async function build(
     }
   }
 
+  updateStatus(`Building ${platform} harness binary (RN ${rnVersion})…`);
   const result = await ensureHarnessBinary({
     platform: platform as 'ios' | 'android',
     reactNativeVersion: rnVersion,
-    nativeModules: [],
+    nativeModules: options.nativeModules ?? [],
     packageRoot,
     projectRoot: appDir,
   });
 
-  if (result.cached) {
-    console.log(`Using cached binary (${result.binaryPath})`);
-  } else {
-    console.log(`Binary built: ${result.binaryPath}`);
+  if (!spinnerActive) {
+    if (result.cached) {
+      console.log(`Using cached binary (${result.binaryPath})`);
+    } else {
+      console.log(`Binary built: ${result.binaryPath}`);
+    }
+    console.log(`\n${platform} build complete.\n`);
   }
-
-  console.log(`\n${platform} build complete.\n`);
   return result;
 }

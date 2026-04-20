@@ -60,7 +60,7 @@ jobs:
 
       - name: Compute cache key
         id: cache-key
-        run: echo "key=android-e2e-$(npx vitest-mobile cache-key android)" >> "$GITHUB_OUTPUT"
+        run: echo "key=android-e2e-$(npx vitest-mobile cache-key --platform android)" >> "$GITHUB_OUTPUT"
 
       - name: Restore cache
         uses: actions/cache/restore@v4
@@ -78,13 +78,22 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Build, boot & install
-        run: npx vitest-mobile bootstrap android --headless --api-level 35
+        run: npx vitest-mobile bootstrap --platform android --headless --api-level 35
 
       - name: Pre-build JS bundle
         run: npx vitest-mobile bundle --platform android
 
       - name: Run E2E tests
         run: npx vitest run --project android
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-mobile-logs-android
+          path: ~/.cache/vitest-mobile/logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Save cache
         uses: actions/cache/save@v4
@@ -113,7 +122,7 @@ jobs:
 
       - name: Compute cache key
         id: cache-key
-        run: echo "key=ios-e2e-$(npx vitest-mobile cache-key ios)" >> "$GITHUB_OUTPUT"
+        run: echo "key=ios-e2e-$(npx vitest-mobile cache-key --platform ios)" >> "$GITHUB_OUTPUT"
 
       - name: Restore cache
         uses: actions/cache/restore@v4
@@ -123,13 +132,22 @@ jobs:
           restore-keys: ios-e2e-
 
       - name: Build, boot & install
-        run: npx vitest-mobile bootstrap ios --headless
+        run: npx vitest-mobile bootstrap --platform ios --headless
 
       - name: Pre-build JS bundle
         run: npx vitest-mobile bundle --platform ios
 
       - name: Run E2E tests
         run: npx vitest run --project ios
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-mobile-logs-ios
+          path: ~/.cache/vitest-mobile/logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Save cache
         uses: actions/cache/save@v4
@@ -166,13 +184,22 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Build, boot & install
-        run: npx vitest-mobile bootstrap android --headless --force --api-level 35
+        run: npx vitest-mobile bootstrap --platform android --headless --force --api-level 35
 
       - name: Pre-build JS bundle
         run: npx vitest-mobile bundle --platform android
 
       - name: Run E2E tests
         run: npx vitest run --project android
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-mobile-logs-android-full
+          path: ~/.cache/vitest-mobile/logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   e2e-ios-full:
     name: E2E Full Build (iOS)
@@ -192,10 +219,19 @@ jobs:
         run: npm run build --workspace=packages/vitest-mobile
 
       - name: Build, boot & install
-        run: npx vitest-mobile bootstrap ios --headless --force
+        run: npx vitest-mobile bootstrap --platform ios --headless --force
 
       - name: Pre-build JS bundle
         run: npx vitest-mobile bundle --platform ios
 
       - name: Run E2E tests
         run: npx vitest run --project ios
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-mobile-logs-ios-full
+          path: ~/.cache/vitest-mobile/logs/
+          if-no-files-found: ignore
+          retention-days: 7

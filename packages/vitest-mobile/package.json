@@ -73,6 +73,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@clack/prompts": "^1.2.0",
     "@shopify/restyle": "^2.4.4",
     "birpc": "^2.3.0",
     "cac": "^6.7.14",

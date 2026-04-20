@@ -20,6 +20,7 @@ import type { CustomResolutionContext, CustomResolver } from 'metro-resolver';
 import type connect from 'connect';
 import type { HandleFunction } from 'connect';
 import type { WebSocketServer } from 'ws';
+import type { MetroConfigCustomizer } from './types';
 
 // ── Lazy-loaded metro + metro-config ──────────────────────────────
 // Neither `metro` nor `metro-config` is a direct dependency of vitest-mobile.
@@ -60,6 +61,11 @@ export interface MetroRunnerOptions {
    * binary.
    */
   harnessProjectDir?: string;
+  /**
+   * User-supplied callback that transforms the harness-anchored base
+   * config before vitest-mobile's test-specific overrides are applied.
+   */
+  metro?: MetroConfigCustomizer;
 }
 
 export interface MetroServer {
@@ -136,7 +142,20 @@ export async function prepareMetroConfig(options: MetroRunnerOptions): Promise<P
     );
   }
   const baseConfig = await loadMetroConfig(projectRoot, outputDir, options.harnessProjectDir);
-  const config = applyTestTransforms(baseConfig, {
+  // Apply user customizer (if any) BEFORE our internal test transforms so
+  // that things like vitest shim resolution and the test-registry module
+  // alias remain authoritative — the customizer can't accidentally unwrap
+  // them. User hooks like extra assetExts or a wrapping resolveRequest still
+  // end up in the final config because applyTestTransforms preserves the
+  // incoming resolver chain via `config.resolver.resolveRequest` capture.
+  const customizedBase = options.metro
+    ? await options.metro(baseConfig, {
+        harnessProjectDir: options.harnessProjectDir,
+        projectRoot,
+        platform: options.platform,
+      })
+    : baseConfig;
+  const config = applyTestTransforms(customizedBase, {
     projectRoot,
     port,
     registryPath,
@@ -307,6 +326,13 @@ export interface BuildBundleOptions {
    * not provided (same logic the pool uses).
    */
   reactNativeVersion?: string;
+  /**
+   * User-supplied callback that transforms the harness-anchored base
+   * config before vitest-mobile's test-specific overrides are applied.
+   * Mirrors `nativePlugin({ metro })`; the bundle CLI reads this back from
+   * the vitest config automatically, so you rarely need to set it directly.
+   */
+  metro?: MetroConfigCustomizer;
 }
 
 export async function buildBundle(options: BuildBundleOptions): Promise<BundleManifest> {
@@ -348,6 +374,7 @@ export async function buildBundle(options: BuildBundleOptions): Promise<BundleMa
       testPatterns,
       appModuleName: 'VitestMobileApp',
       harnessProjectDir: harnessResult.projectDir,
+      metro: options.metro,
     });
 
     const baseName = `index.${platform}.jsbundle`;

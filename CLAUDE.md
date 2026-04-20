@@ -80,10 +80,10 @@ The dev loop:
 
 ```bash
 # Boot a device
-npx vitest-mobile boot-device ios
+npx vitest-mobile boot-device --platform ios
 
 # Build + install the test harness app (~5 min first build, cached after)
-npx vitest-mobile bootstrap ios
+npx vitest-mobile bootstrap --platform ios
 
 # Run all tests
 npx vitest run --project ios
@@ -92,7 +92,7 @@ npx vitest run --project ios
 npx vitest --project ios
 ```
 
-Replace `ios` with `android` for Android. Android also supports `--headless --api-level 35`.
+Replace `--platform ios` with `--platform android` for Android. Android also supports `--headless --api-level 35`.
 
 ### Iterating on Components
 
@@ -121,15 +121,17 @@ All commands: `npx vitest-mobile <command>`
 ### Device & App Lifecycle
 
 ```bash
-npx vitest-mobile boot-device ios
-npx vitest-mobile build ios
-npx vitest-mobile install ios
-npx vitest-mobile bootstrap ios        # build + install in one step
+npx vitest-mobile boot-device --platform ios
+npx vitest-mobile build --platform ios
+npx vitest-mobile install --platform ios
+npx vitest-mobile bootstrap --platform ios        # build + install in one step
 
 # Manual launch on simulator
 xcrun simctl terminate booted com.vitest.mobile.harness
 xcrun simctl launch booted com.vitest.mobile.harness --initialUrl "http://127.0.0.1:8081"
 ```
+
+In a TTY, `--platform` can be omitted on most commands and you'll be prompted to pick one. In CI / non-TTY contexts, omitting `--platform` errors for commands that can't sensibly default to "both" (build, bootstrap, boot-device, reset-device). Fast filesystem-only commands (`trim-cache`, `clean-devices`, `bundle`) default to both platforms when `--platform` is omitted.
 
 ### Debugging & Inspection
 
@@ -211,9 +213,9 @@ The repository uses GitHub Actions (`.github/workflows/ci.yml`). The pipeline ru
 # Shared steps (both platforms)
 - npm ci
 - npm run build --workspace=packages/vitest-mobile
-- Compute cache key: npx vitest-mobile cache-key <platform>
+- Compute cache key: npx vitest-mobile cache-key --platform <platform>
 - Restore cache: ~/.cache/vitest-mobile (+ Android SDK images)
-- Bootstrap: npx vitest-mobile bootstrap <platform> --headless
+- Bootstrap: npx vitest-mobile bootstrap --platform <platform> --headless
 - Pre-build bundle: npx vitest-mobile bundle --platform <platform>
 - Run tests: npx vitest run --project <platform>
 - Save cache
@@ -224,7 +226,7 @@ The `cache-key` command generates a deterministic hash from native dependencies 
 **4. Full Build (Push to main only)** — identical to cached E2E but uses `--force` to skip the cache, ensuring clean builds always work:
 
 ```yaml
-- npx vitest-mobile bootstrap <platform> --headless --force
+- npx vitest-mobile bootstrap --platform <platform> --headless --force
 ```
 
 ## Releasing
@@ -292,7 +294,7 @@ xcrun simctl terminate booted com.vitest.mobile.harness
 xcrun simctl launch booted com.vitest.mobile.harness --initialUrl "http://127.0.0.1:8081"
 ```
 
-**"No development build installed"** — Rebuild native binary: `npx vitest-mobile bootstrap ios`
+**"No development build installed"** — Rebuild native binary: `npx vitest-mobile bootstrap --platform ios`
 
 **Process hanging after tests complete** — The WebSocket server may keep the event loop alive. This is a known upstream issue with the Vitest custom pool API — there's no `close()` lifecycle hook to distinguish "file done" from "run done." See `.github/vitest-custom-pool-close-rfc.md`.
 

@@ -3,6 +3,7 @@
  */
 
 import { execSync, spawn, type ExecSyncOptions } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { log } from '../logger';
@@ -10,7 +11,8 @@ import { run, getAndroidHome, getAdbPath } from '../exec-utils';
 import { getCacheDir } from '../paths';
 import type { DeviceOptions } from '../types';
 import type { DeviceDriver } from './index';
-import { DEFAULT_BUNDLE_ID, isPortListening, isPidAlive, promptConfirm, errorMessage } from './shared';
+import { DEFAULT_BUNDLE_ID, isPortListening, isPidAlive, errorMessage } from './shared';
+import { getDeviceMapping } from './mapping';
 
 let _adb: string | undefined;
 function adb(): string {
@@ -156,7 +158,34 @@ function pickEmulatorConsolePort(excludeSerials: string[]): number {
 const DEFAULT_API_LEVEL = 35;
 const DEFAULT_ARCH = 'x86_64';
 const DEFAULT_TARGET = 'default';
-const AUTO_AVD_NAME = 'vitest-mobile';
+
+/**
+ * AVD naming.
+ *
+ * The current form is `vitest-mobile-<hash8>` where hash8 is the first 8 hex
+ * chars of sha256(resolve(appDir)) — same shape as iOS simulator naming, so
+ * each project gets its own AVD.
+ *
+ * `LEGACY_AVD_NAME` is the pre-isolation bare name. `listAutoCreatedAvds()`
+ * matches both forms so legacy AVDs get swept up by `clean-devices` during
+ * the migration.
+ */
+const AVD_PREFIX = 'vitest-mobile-';
+const LEGACY_AVD_NAME = 'vitest-mobile';
+
+export function avdNameForProject(appDir: string): string {
+  const hash = createHash('sha256').update(resolve(appDir)).digest('hex').slice(0, 8);
+  return `${AVD_PREFIX}${hash}`;
+}
+
+/** All AVD names on the host, for the device picker. */
+export function listAllAvds(): string[] {
+  return getAllAVDs();
+}
+
+function isAutoCreatedAvd(name: string): boolean {
+  return name === LEGACY_AVD_NAME || name.startsWith(AVD_PREFIX);
+}
 
 function findBin(name: string, subdirs: string[]): string {
   const home = getAndroidHome();
@@ -167,12 +196,33 @@ function findBin(name: string, subdirs: string[]): string {
   return name;
 }
 
+function findBinOrNull(name: string, subdirs: string[]): string | null {
+  const home = getAndroidHome();
+  for (const sub of subdirs) {
+    const candidate = resolve(home, sub, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
 function sdkManagerBin(): string {
   return findBin('sdkmanager', ['cmdline-tools/latest/bin', 'tools/bin']);
 }
 
 function avdManagerBin(): string {
   return findBin('avdmanager', ['cmdline-tools/latest/bin', 'tools/bin']);
+}
+
+/**
+ * True if the Android cmdline-tools (sdkmanager + avdmanager) are installed
+ * under ANDROID_HOME. When false, we can't auto-provision a per-project AVD
+ * and fall back to reusing whatever AVD is available.
+ */
+export function hasAvdProvisioningTools(): boolean {
+  return (
+    findBinOrNull('sdkmanager', ['cmdline-tools/latest/bin', 'tools/bin']) !== null &&
+    findBinOrNull('avdmanager', ['cmdline-tools/latest/bin', 'tools/bin']) !== null
+  );
 }
 
 function runLong(cmd: string, opts: ExecSyncOptions = {}): string {
@@ -202,27 +252,46 @@ function installSystemImage(apiLevel: number, target = DEFAULT_TARGET, arch = DE
   log.info(`  System image installed (${((Date.now() - start) / 1000).toFixed(1)}s)`);
 }
 
+function isEmulatorPackageInstalled(): boolean {
+  return existsSync(resolve(getAndroidHome(), 'emulator', 'emulator'));
+}
+
+/**
+ * `avdmanager create avd` refuses with "emulator package must be installed"
+ * if the top-level `emulator` SDK package isn't present — even when a valid
+ * system image is installed. CI runners typically preinstall system-images
+ * but not the emulator package, so we install it here before any AVD work.
+ */
+function ensureEmulatorPackage(): void {
+  if (isEmulatorPackageInstalled()) return;
+  log.info('Installing Android emulator package (required by avdmanager)…');
+  const start = Date.now();
+  runLong(`${sdkManagerBin()} --install emulator`);
+  log.info(`  emulator installed (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+}
+
 function avdHome(): string {
   if (process.env.ANDROID_AVD_HOME) return process.env.ANDROID_AVD_HOME;
   return resolve(getCacheDir(), 'avd');
 }
 
-function ensureAvd(apiLevel: number, target = DEFAULT_TARGET, arch = DEFAULT_ARCH): string {
+function ensureAvd(apiLevel: number, appDir: string, target = DEFAULT_TARGET, arch = DEFAULT_ARCH): string {
+  const desiredName = avdNameForProject(appDir);
   const existing = getAllAVDs();
-  if (existing.includes(AUTO_AVD_NAME)) return AUTO_AVD_NAME;
+  if (existing.includes(desiredName)) return desiredName;
 
   const pkg = systemImagePackage(apiLevel, target, arch);
   const avdBin = avdManagerBin();
   const avdDir = avdHome();
 
-  log.info(`Creating AVD: ${AUTO_AVD_NAME} (API ${apiLevel}, ${arch})`);
+  log.info(`Creating AVD: ${desiredName} (API ${apiLevel}, ${arch})`);
   log.info(`  avdmanager: ${avdBin}`);
   log.info(`  AVD home: ${avdDir}`);
 
   mkdirSync(avdDir, { recursive: true });
 
   try {
-    const output = runLong(`echo no | ${avdBin} create avd --force -n ${AUTO_AVD_NAME} --package '${pkg}'`, {
+    const output = runLong(`echo no | ${avdBin} create avd --force -n ${desiredName} --package '${pkg}'`, {
       env: androidEnv(),
     });
     if (output) log.verbose(`avdmanager: ${output}`);
@@ -231,7 +300,7 @@ function ensureAvd(apiLevel: number, target = DEFAULT_TARGET, arch = DEFAULT_ARC
     throw new Error(`Failed to create AVD:\n${msg}`);
   }
 
-  const avdIni = resolve(avdDir, `${AUTO_AVD_NAME}.ini`);
+  const avdIni = resolve(avdDir, `${desiredName}.ini`);
   if (!existsSync(avdIni)) {
     let contents = '(directory does not exist)';
     if (existsSync(avdDir)) {
@@ -249,16 +318,18 @@ function ensureAvd(apiLevel: number, target = DEFAULT_TARGET, arch = DEFAULT_ARC
   }
 
   log.info(`  AVD created at ${avdDir}`);
-  return AUTO_AVD_NAME;
+  return desiredName;
 }
 
-function ensureAndroidEmulatorReady(apiLevel: number): string {
+function ensureAndroidEmulatorReady(apiLevel: number, appDir: string): string {
   if (!isSystemImageInstalled(apiLevel)) {
     installSystemImage(apiLevel);
   } else {
     log.verbose(`System image already installed for API ${apiLevel}`);
   }
-  return ensureAvd(apiLevel);
+  // Must run before avdmanager — it refuses AVD creation without this.
+  ensureEmulatorPackage();
+  return ensureAvd(apiLevel, appDir);
 }
 
 function disableAndroidAnimations(serial: string): void {
@@ -359,31 +430,37 @@ async function killEmulatorCleanly(serial: string): Promise<void> {
 
 async function bootAndroidEmulator({
   headless = true,
-  bundleId = DEFAULT_BUNDLE_ID,
-  promptForNewDevice = true,
   excludeSerials = [],
   apiLevel,
+  targetAvd,
+  appDir,
+  createIfMissing,
 }: {
   headless?: boolean;
-  bundleId?: string;
-  promptForNewDevice?: boolean;
   excludeSerials?: string[];
   apiLevel?: number;
-} = {}): Promise<string> {
+  /** Explicit AVD name to boot. Required — callers must look this up from the device-mapping file. */
+  targetAvd: string;
+  /** Only used when createIfMissing is true. */
+  appDir?: string;
+  /** If the targetAvd doesn't exist, auto-provision it via avdmanager. */
+  createIfMissing?: boolean;
+}): Promise<string> {
   let allAvds = getAllAVDs();
 
-  if (apiLevel || (headless && allAvds.length === 0)) {
-    ensureAndroidEmulatorReady(apiLevel ?? DEFAULT_API_LEVEL);
-    allAvds = getAllAVDs();
-  }
-
-  if (allAvds.length === 0) {
-    if (promptForNewDevice) {
-      await promptConfirm(
-        'No Android AVDs are available. Create an AVD in Android Studio, then rerun. Continue without creating now?',
+  if (!allAvds.includes(targetAvd)) {
+    if (!createIfMissing) {
+      throw new Error(
+        `AVD '${targetAvd}' was selected for this project but no longer exists.\n` +
+          `Re-run 'vitest-mobile bootstrap' to pick a different one.`,
       );
     }
-    throw new Error('No Android AVDs available. Create one first.');
+    const effectiveAppDir = appDir ?? process.cwd();
+    ensureAndroidEmulatorReady(apiLevel ?? DEFAULT_API_LEVEL, effectiveAppDir);
+    allAvds = getAllAVDs();
+    if (!allAvds.includes(targetAvd)) {
+      throw new Error(`Expected AVD '${targetAvd}' after provisioning but it wasn't found.`);
+    }
   }
 
   const runningAvdNames = new Set<string>();
@@ -392,7 +469,7 @@ async function bootAndroidEmulator({
     if (name) runningAvdNames.add(name);
   }
 
-  const preferredAvd = allAvds.find(a => !runningAvdNames.has(a)) ?? allAvds[0]!;
+  const preferredAvd = targetAvd;
 
   const home = getAndroidHome();
   let emulatorBin = run('which emulator') || resolve(home, 'emulator/emulator');
@@ -520,11 +597,28 @@ export const androidDriver: DeviceDriver = {
     const bundleId = opts.bundleId ?? DEFAULT_BUNDLE_ID;
     const wsPort = opts.wsPort ?? 7878;
     const metroPort = opts.metroPort ?? 18081;
+    const effectiveAppDir = opts.appDir ?? process.cwd();
+
+    // The device-mapping file is authoritative about which AVD this project
+    // uses. Bootstrap writes it; everything downstream reads it. If absent,
+    // refuse to guess — running bootstrap is a one-time step and skipping
+    // it used to silently create surprise AVDs.
+    const mapping = getDeviceMapping(effectiveAppDir, 'android');
+    if (!mapping) {
+      throw new Error(
+        `No Android device configured for this project. Run 'vitest-mobile bootstrap --platform android' first.`,
+      );
+    }
+    const targetAvd = mapping.deviceName;
 
     const online = getAndroidOnlineSerials();
+    // Explicit deviceId wins — caller took responsibility.
     let selected = opts.deviceId ? online.find(s => s === opts.deviceId) : undefined;
     if (!selected) {
+      // Reuse an online emulator only if it's serving *our* AVD.
       for (const s of online) {
+        const runningAvd = getRunningEmulatorAVD(s);
+        if (runningAvd !== targetAvd) continue;
         if (!(await isAndroidDeviceActivelyInUse(s, bundleId, opts.instanceId))) {
           selected = s;
           break;
@@ -535,10 +629,14 @@ export const androidDriver: DeviceDriver = {
     if (!selected) {
       selected = await bootAndroidEmulator({
         headless: opts.headless,
-        bundleId,
-        promptForNewDevice: opts.promptForNewDevice,
         excludeSerials: online,
         apiLevel: opts.apiLevel,
+        targetAvd,
+        appDir: opts.appDir,
+        // If the user originally picked "Create new", we own the AVD and
+        // should recreate it if deleted externally. If they picked an
+        // existing one, we won't touch it.
+        createIfMissing: mapping.createdByUs,
       });
     } else {
       log.verbose(`Android device already running (${selected})`);
@@ -571,3 +669,62 @@ export const androidDriver: DeviceDriver = {
     return serials[0] ?? null;
   },
 };
+
+// ── AVD cleanup (used by `vitest-mobile clean-devices` / `reset-device`) ────
+
+/**
+ * All AVDs that look like vitest-mobile auto-created them — both the new
+ * per-project form (`vitest-mobile-<hash>`) and the legacy bare
+ * `vitest-mobile` name. The legacy match is deliberate so existing users
+ * have a path to clean up their pre-isolation AVD via the CLI.
+ */
+export function listAutoCreatedAvds(): string[] {
+  return getAllAVDs().filter(isAutoCreatedAvd);
+}
+
+/** AVDs belonging to the given project (exact match on the per-project name). */
+export function listProjectAvds(appDir: string): string[] {
+  const desired = avdNameForProject(appDir);
+  return getAllAVDs().filter(n => n === desired);
+}
+
+/**
+ * Shut down any running emulator that's serving one of the given AVDs, then
+ * delete the AVD definitions. Returns the names actually removed.
+ */
+export async function deleteAvdsByName(names: string[]): Promise<string[]> {
+  if (names.length === 0) return [];
+
+  const runningByAvd = new Map<string, string>();
+  for (const serial of getAndroidOnlineSerials()) {
+    const avd = getRunningEmulatorAVD(serial);
+    if (avd) runningByAvd.set(avd, serial);
+  }
+
+  const removed: string[] = [];
+  for (const name of names) {
+    const serial = runningByAvd.get(name);
+    if (serial) {
+      try {
+        await killEmulatorCleanly(serial);
+      } catch (e) {
+        log.warn(`Failed to shut down ${serial} cleanly: ${errorMessage(e)}`);
+      }
+    }
+    try {
+      runLong(`${avdManagerBin()} delete avd -n ${name}`, { env: androidEnv() });
+      removed.push(name);
+    } catch (e) {
+      log.error(`Failed to delete AVD ${name}: ${errorMessage(e)}`);
+    }
+  }
+  return removed;
+}
+
+export async function cleanupAutoCreatedAvds(): Promise<string[]> {
+  return deleteAvdsByName(listAutoCreatedAvds());
+}
+
+export async function cleanupProjectAvds(appDir: string): Promise<string[]> {
+  return deleteAvdsByName(listProjectAvds(appDir));
+}

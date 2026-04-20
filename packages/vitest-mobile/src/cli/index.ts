@@ -1,90 +1,318 @@
 import { rmSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import cac from 'cac';
+import {
+  requirePlatform,
+  resolvePlatformInteractive,
+  resolvePlatformFromCache,
+  resolvePlatformOrBoth,
+  rejectLegacyPositional,
+  expandPlatform,
+  type Platform,
+} from './platform';
+import { withSpinner } from './ui';
 
 const VITEST_CONFIG_FILES = ['vitest.config.ts', 'vitest.config.js', 'vitest.config.mts', 'vitest.config.mjs'];
 
-async function readTestPatternsFromConfig(
-  projectRoot: string,
-  platforms: ('ios' | 'android')[],
-  configPath?: string,
-): Promise<string[]> {
-  const configFile = configPath
+/**
+ * Resolve the vitest config file path that each CLI reader helper loads.
+ * Returns `undefined` when no config can be found (callers decide whether
+ * that's fatal or just means "skip the config-backed default").
+ */
+function resolveVitestConfigFile(projectRoot: string, configPath?: string): string | undefined {
+  const candidate = configPath
     ? resolve(projectRoot, configPath)
     : VITEST_CONFIG_FILES.map(f => resolve(projectRoot, f)).find(f => existsSync(f));
+  return candidate && existsSync(candidate) ? candidate : undefined;
+}
 
-  if (!configFile || !existsSync(configFile)) {
+/**
+ * Load the vitest config via vite's static loader. Returns `null` on any
+ * failure so callers can fall back silently. Memoized per configFile path
+ * because multiple helpers (test patterns, native modules) read the same
+ * config during a single CLI invocation.
+ */
+const _loadedConfigCache = new Map<string, unknown>();
+async function loadVitestConfig(configFile: string, projectRoot: string): Promise<unknown | null> {
+  if (_loadedConfigCache.has(configFile)) {
+    return _loadedConfigCache.get(configFile) ?? null;
+  }
+  try {
+    const { loadConfigFromFile } = await import('vite');
+    const result = await loadConfigFromFile({ command: 'build', mode: 'production' }, configFile, projectRoot);
+    const config = result?.config ?? null;
+    _loadedConfigCache.set(configFile, config);
+    return config;
+  } catch (e) {
+    _loadedConfigCache.set(configFile, null);
+    console.warn(`Failed to load vitest config: ${e instanceof Error ? e.message : e}`);
+    return null;
+  }
+}
+
+async function readTestPatternsFromConfig(
+  projectRoot: string,
+  platforms: Platform[],
+  configPath?: string,
+): Promise<string[]> {
+  const configFile = resolveVitestConfigFile(projectRoot, configPath);
+  if (!configFile) {
     console.warn('No vitest config found — use --include to specify test patterns');
     return [];
   }
 
-  try {
-    const { loadConfigFromFile } = await import('vite');
-    const result = await loadConfigFromFile({ command: 'build', mode: 'production' }, configFile, projectRoot);
-    if (!result) {
-      console.warn('Could not load vitest config — use --include to specify test patterns');
-      return [];
-    }
-
-    const config = result.config as { test?: { projects?: Array<{ test?: { name?: string; include?: string[] } }> } };
-    const projects = config.test?.projects ?? [];
-    const patterns = new Set<string>();
-    for (const project of projects) {
-      const name = project.test?.name;
-      if (name && !platforms.includes(name as 'ios' | 'android')) continue;
-      for (const p of project.test?.include ?? []) {
-        patterns.add(p);
-      }
-    }
-
-    if (patterns.size === 0) {
-      console.warn('No test include patterns found in vitest config — use --include');
-      return [];
-    }
-
-    console.log(`Using test patterns from ${configFile}: ${[...patterns].join(', ')}`);
-    return [...patterns];
-  } catch (e) {
-    console.warn(`Failed to load vitest config: ${e instanceof Error ? e.message : e}`);
-    console.warn('Use --include to specify test patterns manually');
+  const config = (await loadVitestConfig(configFile, projectRoot)) as {
+    test?: { projects?: Array<{ test?: { name?: string; include?: string[] } }> };
+  } | null;
+  if (!config) {
+    console.warn('Could not load vitest config — use --include to specify test patterns');
     return [];
   }
+
+  const projects = config.test?.projects ?? [];
+  const patterns = new Set<string>();
+  for (const project of projects) {
+    const name = project.test?.name;
+    if (name && !platforms.includes(name as Platform)) continue;
+    for (const p of project.test?.include ?? []) {
+      patterns.add(p);
+    }
+  }
+
+  if (patterns.size === 0) {
+    console.warn('No test include patterns found in vitest config — use --include');
+    return [];
+  }
+
+  console.log(`Using test patterns from ${configFile}: ${[...patterns].join(', ')}`);
+  return [...patterns];
+}
+
+/**
+ * Read `nativeModules` from `nativePlugin(...)` options declared in a vitest
+ * config, scoped to the given platform projects. Returns the deduplicated
+ * union across all matching projects.
+ *
+ * nativePlugin stashes its original options on the returned Plugin object
+ * under `VITEST_MOBILE_PLUGIN_OPTIONS_KEY` so we can recover them here
+ * without evaluating the plugin's `config()` hook or booting a full vitest
+ * instance.
+ */
+async function readNativeModulesFromConfig(
+  projectRoot: string,
+  platforms: Platform[],
+  configPath?: string,
+): Promise<string[]> {
+  const configFile = resolveVitestConfigFile(projectRoot, configPath);
+  if (!configFile) return [];
+
+  const config = (await loadVitestConfig(configFile, projectRoot)) as {
+    test?: {
+      projects?: Array<{
+        test?: { name?: string };
+        plugins?: unknown[];
+      }>;
+    };
+  } | null;
+  if (!config) return [];
+
+  const { VITEST_MOBILE_PLUGIN_OPTIONS_KEY: OPTIONS_KEY } = await import('../node/index');
+  const projects = config.test?.projects ?? [];
+  const modules = new Set<string>();
+  for (const project of projects) {
+    const name = project.test?.name;
+    if (name && !platforms.includes(name as Platform)) continue;
+    for (const plugin of project.plugins ?? []) {
+      if (!plugin || typeof plugin !== 'object') continue;
+      const stored = (plugin as Record<string, unknown>)[OPTIONS_KEY] as { nativeModules?: string[] } | undefined;
+      for (const mod of stored?.nativeModules ?? []) {
+        modules.add(mod);
+      }
+    }
+  }
+  return [...modules];
+}
+
+/**
+ * Compute the final native-modules list for a CLI command. An explicit
+ * `--native-modules` flag wins; otherwise the value falls back to whatever
+ * is declared on the `nativePlugin({ nativeModules })` in the vitest config.
+ */
+async function resolveNativeModules(
+  cliFlag: string | undefined,
+  projectRoot: string,
+  platforms: Platform[],
+  configPath?: string,
+): Promise<string[]> {
+  const explicit = parseNativeModules(cliFlag);
+  if (explicit.length > 0) return explicit;
+  return readNativeModulesFromConfig(projectRoot, platforms, configPath);
+}
+
+/**
+ * Read the `metro` config customizer declared on `nativePlugin(...)` in a
+ * vitest config, scoped to the given platforms. If multiple matching plugin
+ * instances each specify one, they are composed left-to-right (first listed
+ * plugin's customizer runs first; each receives the output of the previous).
+ * Returns undefined if no customizer is declared on any matching plugin.
+ */
+async function readMetroCustomizerFromConfig(
+  projectRoot: string,
+  platforms: Platform[],
+  configPath?: string,
+): Promise<import('../node/types').MetroConfigCustomizer | undefined> {
+  const configFile = resolveVitestConfigFile(projectRoot, configPath);
+  if (!configFile) return undefined;
+
+  const config = (await loadVitestConfig(configFile, projectRoot)) as {
+    test?: {
+      projects?: Array<{
+        test?: { name?: string };
+        plugins?: unknown[];
+      }>;
+    };
+  } | null;
+  if (!config) return undefined;
+
+  const { VITEST_MOBILE_PLUGIN_OPTIONS_KEY: OPTIONS_KEY } = await import('../node/index');
+  const customizers: import('../node/types').MetroConfigCustomizer[] = [];
+  for (const project of config.test?.projects ?? []) {
+    const name = project.test?.name;
+    if (name && !platforms.includes(name as Platform)) continue;
+    for (const plugin of project.plugins ?? []) {
+      if (!plugin || typeof plugin !== 'object') continue;
+      const stored = (plugin as Record<string, unknown>)[OPTIONS_KEY] as
+        | { metro?: import('../node/types').MetroConfigCustomizer }
+        | undefined;
+      if (typeof stored?.metro === 'function') {
+        customizers.push(stored.metro);
+      }
+    }
+  }
+  if (customizers.length === 0) return undefined;
+  if (customizers.length === 1) return customizers[0];
+  return async (cfg, ctx) => {
+    let current = cfg;
+    for (const fn of customizers) {
+      current = await fn(current, ctx);
+    }
+    return current;
+  };
 }
 
 const cli = cac('vitest-mobile');
 
+/**
+ * Parse a comma-separated list of native module package names into an array.
+ * Used by the CLI commands that feed into `ensureHarnessBinary`.
+ */
+function parseNativeModules(input?: string): string[] {
+  return input
+    ? input
+        .split(',')
+        .map(m => m.trim())
+        .filter(Boolean)
+    : [];
+}
+
+// ── Commands ─────────────────────────────────────────────────────────
+
 cli
-  .command('build <platform>', 'Build the harness binary')
+  .command('build', 'Build the harness binary')
+  .option('--platform <platform>', 'ios or android (prompts if omitted in TTY)')
   .option('--app-dir <dir>', 'App directory', { default: '.' })
   .option('--force', 'Force rebuild (clear cache)')
-  .action(async (platform: string, options: { appDir: string; force: boolean }) => {
+  .option('--native-modules <modules>', 'Comma-separated list of react-native native modules (overrides vitest config)')
+  .action(async (options: { platform?: string; appDir: string; force: boolean; nativeModules?: string }) => {
+    rejectLegacyPositional(cli.args);
+    const platform = (await resolvePlatformInteractive(options.platform, {
+      command: 'build',
+    })) as Platform;
     const { build } = await import('./build');
-    await build(platform, options);
+    const appDir = resolve(process.cwd(), options.appDir);
+    const nativeModules = await resolveNativeModules(options.nativeModules, appDir, [platform]);
+    await withSpinner(
+      { command: 'build', platform, initialMessage: `Building ${platform} harness binary…` },
+      async () => {
+        await build(platform, {
+          appDir: options.appDir,
+          force: options.force,
+          nativeModules,
+        });
+      },
+    );
   });
 
 cli
-  .command('install <platform>', 'Install harness binary on device')
+  .command('install', 'Install harness binary on device')
+  .option('--platform <platform>', 'ios or android (inferred from cached builds if omitted)')
   .option('--app-dir <dir>', 'App directory', { default: '.' })
-  .action(async (platform: string, options: { appDir: string }) => {
+  .option('--native-modules <modules>', 'Comma-separated list of react-native native modules (overrides vitest config)')
+  .action(async (options: { platform?: string; appDir: string; nativeModules?: string }) => {
+    rejectLegacyPositional(cli.args);
+    const platform = (await resolvePlatformFromCache(options.platform, {
+      command: 'install',
+    })) as Platform;
     const { install } = await import('./install');
-    await install(platform, options);
+    const appDir = resolve(process.cwd(), options.appDir);
+    const nativeModules = await resolveNativeModules(options.nativeModules, appDir, [platform]);
+    await withSpinner(
+      { command: 'install', platform, initialMessage: `Installing ${platform} harness binary…` },
+      async () => {
+        await install(platform, {
+          appDir: options.appDir,
+          nativeModules,
+        });
+      },
+    );
   });
 
 cli
-  .command('bootstrap <platform>', 'Build + boot + install in one step (snapshot-aware in CI)')
+  .command('bootstrap', 'Build + boot + install in one step (snapshot-aware in CI)')
+  .option('--platform <platform>', 'ios or android (prompts if omitted in TTY)')
   .option('--app-dir <dir>', 'App directory', { default: '.' })
   .option('--force', 'Force rebuild (clear cache)')
   .option('--headless', 'Run without GUI — enables snapshot save/restore and cache trimming (for CI)')
   .option('--api-level <level>', 'Android API level — auto-installs system image + creates AVD if needed')
+  .option('--device <name>', 'Simulator/AVD name to use (skips interactive picker)')
+  .option('--native-modules <modules>', 'Comma-separated list of react-native native modules (overrides vitest config)')
   .action(
-    async (platform: string, options: { appDir: string; force: boolean; headless?: boolean; apiLevel?: string }) => {
+    async (options: {
+      platform?: string;
+      appDir: string;
+      force: boolean;
+      headless?: boolean;
+      apiLevel?: string;
+      device?: string;
+      nativeModules?: string;
+    }) => {
+      rejectLegacyPositional(cli.args);
+      const platform = (await resolvePlatformInteractive(options.platform, {
+        command: 'bootstrap',
+      })) as Platform;
       const { bootstrap } = await import('./bootstrap');
-      await bootstrap(platform, {
-        appDir: options.appDir,
-        force: options.force ?? false,
-        headless: options.headless ?? false,
-        apiLevel: options.apiLevel ? Number(options.apiLevel) : undefined,
-      });
+      const { ensureDeviceMapping } = await import('./device-picker');
+      const appDir = resolve(process.cwd(), options.appDir);
+      const nativeModules = await resolveNativeModules(options.nativeModules, appDir, [platform]);
+
+      // Pick the device BEFORE starting the spinner — the picker needs the
+      // terminal, and @clack's spinner + select don't play well concurrently.
+      // `alwaysPrompt` so every bootstrap lets the user reselect, with their
+      // current choice pre-selected as the default (hit Enter to keep it).
+      await ensureDeviceMapping({ platform, appDir, deviceFlag: options.device, alwaysPrompt: true });
+
+      await withSpinner(
+        { command: 'bootstrap', platform, initialMessage: `Bootstrapping ${platform} harness…` },
+        async () => {
+          await bootstrap(platform, {
+            appDir: options.appDir,
+            force: options.force ?? false,
+            headless: options.headless ?? false,
+            apiLevel: options.apiLevel ? Number(options.apiLevel) : undefined,
+            nativeModules,
+          });
+        },
+      );
     },
   );
 
@@ -97,6 +325,7 @@ cli
   .option('--include <patterns>', 'Test file glob patterns (comma-separated, overrides vitest config)')
   .option('--config <path>', 'Path to vitest config file')
   .option('--no-dev', 'Build in production mode (minified)')
+  .option('--native-modules <modules>', 'Comma-separated list of react-native native modules (overrides vitest config)')
   .action(
     async (options: {
       platform?: string;
@@ -106,11 +335,12 @@ cli
       include?: string;
       config?: string;
       dev: boolean;
+      nativeModules?: string;
     }) => {
+      rejectLegacyPositional(cli.args);
+      const choice = resolvePlatformOrBoth(options.platform);
+      const platforms = expandPlatform(choice);
       const { buildBundle } = await import('../node/metro-runner');
-      const platforms: ('ios' | 'android')[] = options.platform
-        ? [options.platform as 'ios' | 'android']
-        : ['ios', 'android'];
       const outDir = resolve(process.cwd(), options.out);
       const testPatterns = options.include
         ? options.include.split(',').map(p => p.trim())
@@ -119,44 +349,80 @@ cli
         console.error('No test patterns found. Provide --include or ensure vitest config has test.include.');
         process.exit(1);
       }
-      await buildBundle({
-        projectRoot: process.cwd(),
-        outDir,
-        platforms,
-        wsPort: Number(options.wsPort),
-        metroPort: Number(options.metroPort),
-        testPatterns,
-        dev: options.dev,
-      });
+      const nativeModules = await resolveNativeModules(options.nativeModules, process.cwd(), platforms, options.config);
+      const metro = await readMetroCustomizerFromConfig(process.cwd(), platforms, options.config);
+      await withSpinner(
+        {
+          command: 'bundle',
+          platform: choice === 'both' ? undefined : choice,
+          initialMessage: `Bundling JS for ${choice === 'both' ? 'ios + android' : choice}…`,
+        },
+        async () => {
+          await buildBundle({
+            projectRoot: process.cwd(),
+            outDir,
+            platforms,
+            wsPort: Number(options.wsPort),
+            metroPort: Number(options.metroPort),
+            testPatterns,
+            dev: options.dev,
+            nativeModules,
+            metro,
+          });
+        },
+      );
     },
   );
 
 cli
-  .command('boot-device <platform>', 'Start a simulator or emulator')
+  .command('boot-device', 'Start a simulator or emulator')
+  .option('--platform <platform>', 'ios or android (prompts if omitted in TTY)')
   .option('--ws-port <port>', 'WebSocket port', { default: '7878' })
   .option('--metro-port <port>', 'Metro port', { default: '18081' })
   .option('--headless', 'Run without GUI (for CI)')
   .option('--api-level <level>', 'Android API level — auto-installs system image + creates AVD if needed')
+  .option('--device <name>', 'Simulator/AVD name to use (skips interactive picker)')
   .action(
-    async (platform: string, options: { wsPort: string; metroPort: string; headless?: boolean; apiLevel?: string }) => {
+    async (options: {
+      platform?: string;
+      wsPort: string;
+      metroPort: string;
+      headless?: boolean;
+      apiLevel?: string;
+      device?: string;
+    }) => {
+      rejectLegacyPositional(cli.args);
+      const platform = (await resolvePlatformInteractive(options.platform, {
+        command: 'boot-device',
+      })) as Platform;
       const { ensureDevice } = await import('../node/device');
-      await ensureDevice(platform as 'ios' | 'android', {
-        headless: options.headless ?? false,
-        wsPort: Number(options.wsPort),
-        metroPort: Number(options.metroPort),
-        apiLevel: options.apiLevel ? Number(options.apiLevel) : undefined,
-      });
-      console.log(`${platform} device ready.`);
+      const { ensureDeviceMapping } = await import('./device-picker');
+      const appDir = process.cwd();
+      await ensureDeviceMapping({ platform, appDir, deviceFlag: options.device });
+      await withSpinner(
+        { command: 'boot-device', platform, initialMessage: `Booting ${platform} device…` },
+        async () => {
+          await ensureDevice(platform, {
+            headless: options.headless ?? false,
+            wsPort: Number(options.wsPort),
+            metroPort: Number(options.metroPort),
+            apiLevel: options.apiLevel ? Number(options.apiLevel) : undefined,
+            appDir,
+          });
+        },
+      );
     },
   );
 
 cli
   .command('screenshot', 'Take a simulator screenshot')
-  .option('--platform <platform>', 'ios or android')
+  .option('--platform <platform>', 'ios or android (defaults to any running device)')
   .option('--output <path>', 'Output file path')
   .action(async (options: { platform?: string; output?: string }) => {
+    rejectLegacyPositional(cli.args);
+    const platform = options.platform ? (requirePlatform(options.platform, 'screenshot') as Platform) : undefined;
     const { screenshot } = await import('./screenshot');
-    await screenshot(options);
+    screenshot({ platform, output: options.output });
   });
 
 cli
@@ -176,10 +442,13 @@ cli
   });
 
 cli
-  .command('cache-key <platform>', 'Print the deterministic cache key for the harness build')
+  .command('cache-key', 'Print the deterministic cache key for the harness build')
+  .option('--platform <platform>', 'ios or android (required — output depends on platform)')
   .option('--app-dir <dir>', 'App directory', { default: '.' })
-  .option('--native-modules <modules>', 'Comma-separated list of native modules')
-  .action(async (platform: string, options: { appDir: string; nativeModules?: string }) => {
+  .option('--native-modules <modules>', 'Comma-separated list of react-native native modules (overrides vitest config)')
+  .action(async (options: { platform?: string; appDir: string; nativeModules?: string }) => {
+    rejectLegacyPositional(cli.args);
+    const platform = requirePlatform(options.platform, 'cache-key');
     const { fileURLToPath } = await import('node:url');
     const packageRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
     const appDir = resolve(process.cwd(), options.appDir);
@@ -194,12 +463,7 @@ cli
       );
       process.exit(1);
     }
-    const nativeModules = options.nativeModules
-      ? options.nativeModules
-          .split(',')
-          .map(m => m.trim())
-          .filter(Boolean)
-      : [];
+    const nativeModules = await resolveNativeModules(options.nativeModules, appDir, [platform]);
     const key = computeCacheKey({
       reactNativeVersion: rnVersion,
       nativeModules,
@@ -209,14 +473,20 @@ cli
   });
 
 cli
-  .command('trim-cache <platform>', 'Remove intermediate build artifacts from cache (keeps only the final binary)')
-  .action(async (platform: string) => {
+  .command('trim-cache', 'Remove intermediate build artifacts (keeps only the final binary)')
+  .option('--platform <platform>', 'ios or android (omit to trim both)')
+  .action(async (options: { platform?: string }) => {
+    rejectLegacyPositional(cli.args);
+    const choice = resolvePlatformOrBoth(options.platform);
+    const platforms = expandPlatform(choice);
     const { trimBuildCache } = await import('../node/harness-builder');
-    const result = trimBuildCache({ platform: platform as 'ios' | 'android' });
-    if (result.trimmed) {
-      console.log(`Cache trimmed: ${formatBytes(result.before)} → ${formatBytes(result.after)}`);
-    } else {
-      console.log('No build cache to trim.');
+    for (const p of platforms) {
+      const result = trimBuildCache({ platform: p });
+      if (result.trimmed) {
+        console.log(`[${p}] Cache trimmed: ${formatBytes(result.before)} → ${formatBytes(result.after)}`);
+      } else {
+        console.log(`[${p}] No build cache to trim.`);
+      }
     }
   });
 
@@ -248,25 +518,108 @@ cli.command('clean', 'Remove all cached harness binaries and generated files').a
 });
 
 cli
-  .command('clean-devices <platform>', 'List or remove auto-created persistent devices')
+  .command('clean-devices', 'List or remove auto-created persistent devices')
+  .option('--platform <platform>', 'ios or android (omit to clean both)')
   .option('--apply', 'Actually remove devices (default is dry run)')
-  .action(async (platform: string, options: { apply?: boolean }) => {
+  .action(async (options: { platform?: string; apply?: boolean }) => {
+    rejectLegacyPositional(cli.args);
     const { listAutoCreatedDeviceIds, cleanupAutoCreatedDevices } = await import('../node/device');
-    const p = platform as 'ios' | 'android';
-    const existing = listAutoCreatedDeviceIds(p);
+    const choice = resolvePlatformOrBoth(options.platform);
+    const platforms = expandPlatform(choice);
+    let totalFound = 0;
+    for (const p of platforms) {
+      const existing = listAutoCreatedDeviceIds(p);
+      if (existing.length === 0) {
+        console.log(`[${p}] No auto-created devices found.`);
+        continue;
+      }
+      totalFound += existing.length;
+      if (!options.apply) {
+        console.log(`[${p}] Auto-created devices:`);
+        for (const id of existing) console.log(`  - ${id}`);
+      } else {
+        const removed = await cleanupAutoCreatedDevices(p);
+        console.log(`[${p}] Removed ${removed.length} device(s).`);
+      }
+    }
+    if (!options.apply && totalFound > 0) {
+      console.log('\nRun with --apply to delete.');
+    }
+  });
+
+cli
+  .command('reset-device', "Clear this project's chosen device (deletes the device only if we created it)")
+  .option('--platform <platform>', 'ios or android (prompts if omitted in TTY)')
+  .option('--apply', 'Actually remove the device (default is dry run)')
+  .action(async (options: { platform?: string; apply?: boolean }) => {
+    rejectLegacyPositional(cli.args);
+    const platform = (await resolvePlatformInteractive(options.platform, {
+      command: 'reset-device',
+    })) as Platform;
+    const { getDeviceMapping, clearDeviceMapping } = await import('../node/device/mapping');
+    const appDir = process.cwd();
+    const mapping = getDeviceMapping(appDir, platform);
+    if (!mapping) {
+      console.log(`No vitest-mobile ${platform} device configured for ${appDir}.`);
+      return;
+    }
+
+    if (!mapping.createdByUs) {
+      // User picked an existing simulator/AVD of their own — we never touch it.
+      // Just clear the mapping so next bootstrap re-prompts.
+      if (!options.apply) {
+        console.log(
+          `Configured ${platform} device for ${appDir}: ${mapping.deviceName} (not created by vitest-mobile).`,
+        );
+        console.log('Run with --apply to clear the mapping (the device itself will not be deleted).');
+        return;
+      }
+      clearDeviceMapping(appDir, platform);
+      console.log(`Cleared ${platform} device mapping (left '${mapping.deviceName}' intact).`);
+      return;
+    }
+
+    // createdByUs: delete the device + any secondaries, then clear the mapping.
+    const { listProjectDeviceIds, cleanupProjectDevices } = await import('../node/device');
+    const existing = listProjectDeviceIds(platform, appDir);
     if (existing.length === 0) {
-      console.log('No auto-created devices found.');
+      // Mapping existed but device is gone — just clear the mapping.
+      if (!options.apply) {
+        console.log(
+          `Configured ${platform} device '${mapping.deviceName}' is already gone; run --apply to clear the mapping.`,
+        );
+        return;
+      }
+      clearDeviceMapping(appDir, platform);
+      console.log(`Cleared stale ${platform} device mapping.`);
       return;
     }
     if (!options.apply) {
-      console.log('Auto-created devices:');
+      console.log(`${platform} devices for ${appDir}:`);
       for (const id of existing) console.log(`  - ${id}`);
       console.log('Run with --apply to delete.');
       return;
     }
-    const removed = cleanupAutoCreatedDevices(p);
-    console.log(`Removed ${removed.length} device(s).`);
+    const removed = await cleanupProjectDevices(platform, appDir);
+    clearDeviceMapping(appDir, platform);
+    console.log(`Removed ${removed.length} ${platform} device(s) and cleared mapping.`);
   });
 
 cli.help();
+
+// `command:*` fires during .parse() when a command was attempted but didn't
+// match; without this handler cac silently exits 0 on unknown commands.
+cli.on('command:*', () => {
+  const attempted = cli.args.join(' ') || '(none)';
+  console.error(`Unknown command: ${attempted}\n`);
+  cli.outputHelp();
+  process.exit(1);
+});
+
 cli.parse();
+
+// If no command matched AND no positional args were given, treat as
+// `--help`. cac's `command:*` doesn't fire in the empty-argv case.
+if (!cli.matchedCommand && cli.args.length === 0 && process.argv.length <= 2) {
+  cli.outputHelp();
+}

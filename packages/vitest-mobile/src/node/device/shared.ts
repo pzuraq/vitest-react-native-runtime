@@ -23,6 +23,8 @@ export async function promptConfirm(message: string): Promise<boolean> {
   return new Promise(resolvePrompt => {
     process.stdin.resume();
     process.stdin.once('data', data => {
+      // Pause immediately so stdin doesn't keep the event loop alive after this prompt.
+      process.stdin.pause();
       const answer = String(data).trim().toLowerCase();
       resolvePrompt(answer === 'y' || answer === 'yes');
     });

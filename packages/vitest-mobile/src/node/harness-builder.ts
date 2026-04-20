@@ -11,11 +11,11 @@
  */
 
 import { createHash } from 'node:crypto';
-import { execSync, type ExecSyncOptions } from 'node:child_process';
+import { execSync, spawn, type ExecSyncOptions } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, cpSync, rmSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { log } from './logger';
+import { log, getLogSink } from './logger';
 import { getCacheDir } from './paths';
 import type { Platform } from './types';
 
@@ -61,7 +61,7 @@ const DEFAULT_BUILD_TIMEOUT = 30 * 60 * 1000; // 30 minutes
 // v4: merge scaffolded package.json (preserves RN template devDeps incl. @react-native/metro-config)
 //     + preserve node_modules in trimBuildCache + exports "./package.json" for TurboModule
 //     autolinking. Old binaries built pre-v4 are missing VitestMobileHarness registration.
-const BUILD_FORMAT_VERSION = 4;
+const BUILD_FORMAT_VERSION = 5;
 
 // ── Public API ─────────────────────────────────────────────────────
 
@@ -138,7 +138,7 @@ export async function ensureHarnessBinary(options: HarnessBuildOptions): Promise
       log.info('');
 
       await scaffoldProject(buildDir, options);
-      customizeProject(projectDir, options, cacheKey);
+      await customizeProject(projectDir, options, cacheKey);
       writeFileSync(resolve(projectDir, '.vitest-mobile-customized'), '');
     } else {
       log.info('Using cached project (scaffold + customization already done)');
@@ -174,6 +174,22 @@ export function detectReactNativeVersion(projectRoot: string): string | null {
   if (!pkgPath) return null;
   const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
   return pkg.version;
+}
+
+/**
+ * True if any cached binary exists for the given platform under the shared
+ * builds/ dir. Used by `vitest-mobile install` to infer `--platform` when
+ * omitted — if only one platform has been built, that's almost certainly
+ * what the user wants to install.
+ */
+export function hasAnyCachedBinary(platform: Platform): boolean {
+  const buildsDir = resolve(getCacheDir(), 'builds');
+  if (!existsSync(buildsDir)) return false;
+  for (const entry of readdirSync(buildsDir)) {
+    const binaryPath = getBinaryPath(resolve(buildsDir, entry), platform);
+    if (existsSync(binaryPath) && isBinaryValid(binaryPath, platform)) return true;
+  }
+  return false;
 }
 
 /**
@@ -368,18 +384,49 @@ function run(cmd: string, opts: ExecSyncOptions = {}): string {
   ).trim();
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
   log.verbose(`  ✓ ${elapsed}s`);
+  const sink = getLogSink();
+  if (sink && result) {
+    sink.write(`$ ${cmd}\n${result}\n`);
+  }
   return result;
 }
 
-/** Like run(), but streams output to the terminal so long commands show progress. */
-function runLive(cmd: string, opts: ExecSyncOptions = {}): void {
+/**
+ * Like run(), but streams output to the terminal so long commands show progress.
+ *
+ * When a log sink is active (the CLI wrapped this invocation in a spinner),
+ * child output is streamed live to the log file via async spawn — this keeps
+ * the Node event loop free so the spinner can animate and SIGINT reaches
+ * this process. Without this the terminal would appear frozen for the full
+ * xcodebuild / gradle runtime and Ctrl+C wouldn't interrupt.
+ */
+async function runLive(cmd: string, opts: ExecSyncOptions = {}): Promise<void> {
   log.verbose(`$ ${cmd}`);
-  execSync(cmd, {
-    encoding: 'utf8',
-    stdio: 'inherit',
+  const sink = getLogSink();
+  const baseOpts = {
     timeout: DEFAULT_BUILD_TIMEOUT,
     env: { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' },
     ...opts,
+  };
+
+  if (!sink) {
+    execSync(cmd, { encoding: 'utf8', stdio: 'inherit', ...baseOpts });
+    return;
+  }
+
+  sink.write(`$ ${cmd}\n`);
+  await new Promise<void>((resolvePromise, reject) => {
+    const child = spawn('sh', ['-c', cmd], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...baseOpts,
+    });
+    child.stdout?.on('data', chunk => sink.write(chunk));
+    child.stderr?.on('data', chunk => sink.write(chunk));
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code === 0) resolvePromise();
+      else reject(new Error(`Command failed with exit code ${code ?? 'null'}: ${cmd}`));
+    });
   });
 }
 
@@ -396,7 +443,9 @@ async function scaffoldProject(buildDir: string, options: HarnessBuildOptions): 
 
   // Use @react-native-community/cli to init a project matching the user's RN version.
   // This ensures the Xcode project template matches the RN version exactly.
-  run(
+  // runLive (async when a log sink is active) keeps the spinner animating
+  // during this ~30s operation; run() would block the event loop sync.
+  await runLive(
     `npx @react-native-community/cli init ${HARNESS_APP_NAME} --version ${options.reactNativeVersion} --skip-install --skip-git-init`,
     { cwd: buildDir },
   );
@@ -415,7 +464,7 @@ async function scaffoldProject(buildDir: string, options: HarnessBuildOptions): 
 
 // ── Customize ──────────────────────────────────────────────────────
 
-function customizeProject(projectDir: string, options: HarnessBuildOptions, cacheKey: string): void {
+async function customizeProject(projectDir: string, options: HarnessBuildOptions, cacheKey: string): Promise<void> {
   log.info('Customizing harness project...');
 
   customizeIOS(projectDir, cacheKey);
@@ -465,8 +514,61 @@ function customizeProject(projectDir: string, options: HarnessBuildOptions, cach
   // 3. Install dependencies
   log.info('Installing dependencies... (this may take a minute)');
   const depsStart = Date.now();
-  runLive('npm install', { cwd: projectDir });
+  await runLive('npm install', { cwd: projectDir });
   log.info(`  Dependencies installed (${((Date.now() - depsStart) / 1000).toFixed(1)}s)`);
+}
+
+/**
+ * Xcode 26.4+ ships a stricter Apple Clang that rejects the consteval pattern
+ * in fmt 11.0.2 (bundled via RCT-Folly on React Native 0.81.x). Inject a
+ * post_install hook that downgrades just the `fmt` pod to C++17, which skips
+ * the consteval path and falls back to runtime format-string validation. The
+ * rest of the project keeps C++20, which RN itself requires.
+ *
+ * Upstream fix: facebook/react-native#56099. Once that lands in a 0.81.x
+ * patch and we adopt it, this shim can be removed.
+ */
+function injectFmtCxx17Fix(podfile: string): string {
+  if (podfile.includes("target.name == 'fmt'")) {
+    return podfile;
+  }
+  const marker = 'react_native_post_install(';
+  const markerIdx = podfile.indexOf(marker);
+  if (markerIdx === -1) {
+    return podfile;
+  }
+  // Find the end of the react_native_post_install(...) call, then insert
+  // our target tweak after its closing paren + newline.
+  let depth = 0;
+  let i = podfile.indexOf('(', markerIdx);
+  for (; i < podfile.length; i++) {
+    const c = podfile[i];
+    if (c === '(') depth++;
+    else if (c === ')') {
+      depth--;
+      if (depth === 0) {
+        i++;
+        break;
+      }
+    }
+  }
+  while (i < podfile.length && podfile[i] !== '\n') i++;
+  const insertAt = i;
+  const patch = `
+
+    # Workaround for Xcode 26.4+: Apple Clang 21 rejects the consteval usage
+    # in fmt 11.0.2 (bundled via RCT-Folly). Downgrade just the fmt pod to
+    # C++17 so the consteval path is skipped; runtime format-string checking
+    # still works. Remove once React Native pulls in a fmt release that
+    # compiles under the new Clang (see facebook/react-native#56099).
+    installer.pods_project.targets.each do |target|
+      if target.name == 'fmt'
+        target.build_configurations.each do |cfg|
+          cfg.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'c++17'
+        end
+      end
+    end`;
+  return podfile.slice(0, insertAt) + patch + podfile.slice(insertAt);
 }
 
 function customizeIOS(projectDir: string, cacheKey: string): void {
@@ -487,6 +589,7 @@ function customizeIOS(projectDir: string, cacheKey: string): void {
   if (existsSync(podfilePath)) {
     let podfile = readFileSync(podfilePath, 'utf8');
     podfile = podfile.replace(/platform\s+:ios,\s*.+/, "platform :ios, '16.0'");
+    podfile = injectFmtCxx17Fix(podfile);
     writeFileSync(podfilePath, podfile);
   }
 
@@ -570,18 +673,85 @@ async function buildProject(projectDir: string, platform: Platform): Promise<voi
   }
 }
 
+/**
+ * Preflight check before invoking xcodebuild on iOS. xcodebuild fails with
+ * a terse `Found no destinations for the scheme` when the active Xcode SDK's
+ * iOS version doesn't have a matching installed simulator runtime — a very
+ * common condition after upgrading Xcode, since SDKs and runtimes are
+ * separately installable.
+ *
+ * We check here so users get an actionable error (with the exact download
+ * command) before paying for the pod install + build warmup.
+ */
+function preflightIOSToolchain(): void {
+  let sdkVersion: string | null = null;
+  try {
+    sdkVersion = execSync('xcrun --show-sdk-version --sdk iphonesimulator', {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    // No iphonesimulator SDK at all — xcodebuild will surface its own
+    // error and there's nothing useful we can add here.
+    return;
+  }
+  if (!sdkVersion) return;
+  const sdkMajor = sdkVersion.split('.')[0];
+
+  let runtimesJson = '';
+  try {
+    runtimesJson = execSync('xcrun simctl list runtimes --json', {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    return;
+  }
+
+  let runtimes: Array<{ version?: string; platform?: string; isAvailable?: boolean }> = [];
+  try {
+    const parsed = JSON.parse(runtimesJson) as {
+      runtimes?: Array<{ version?: string; platform?: string; isAvailable?: boolean }>;
+    };
+    runtimes = parsed.runtimes ?? [];
+  } catch {
+    return;
+  }
+
+  const iosRuntimes = runtimes.filter(r => r.platform === 'iOS' && r.isAvailable !== false && r.version);
+  const hasMatching = iosRuntimes.some(r => r.version?.split('.')[0] === sdkMajor);
+  if (hasMatching) return;
+
+  const installed =
+    iosRuntimes
+      .map(r => r.version)
+      .filter(Boolean)
+      .join(', ') || 'none';
+  throw new Error(
+    `Xcode's active iOS Simulator SDK is ${sdkVersion}, but no iOS ${sdkMajor}.x ` +
+      `simulator runtime is installed (installed: ${installed}).\n\n` +
+      `Install the matching runtime with either:\n` +
+      `  xcodebuild -downloadPlatform iOS\n` +
+      `  # or via Xcode: Settings → Components → iOS ${sdkMajor} → Get\n\n` +
+      `This is an Xcode setup issue, not a vitest-mobile bug — xcodebuild would ` +
+      `fail next with "Found no destinations for the scheme" without this message.`,
+  );
+}
+
 async function buildIOS(projectDir: string): Promise<void> {
+  preflightIOSToolchain();
+
   const iosDir = resolve(projectDir, 'ios');
 
   // Install gems + pods (bundle exec ensures compatible CocoaPods version)
   log.info('Installing Ruby gems...');
   let stepStart = Date.now();
-  runLive('bundle install', { cwd: projectDir });
+  await runLive('bundle install', { cwd: projectDir });
   log.info(`  Gems installed (${((Date.now() - stepStart) / 1000).toFixed(1)}s)`);
 
   log.info('Running pod install... (this may take a minute)');
   stepStart = Date.now();
-  runLive('bundle exec pod install', { cwd: iosDir });
+  await runLive('bundle exec pod install', { cwd: iosDir });
   log.info(`  Pods installed (${((Date.now() - stepStart) / 1000).toFixed(1)}s)`);
 
   log.info('Building for iOS simulator (this may take a few minutes)...');
@@ -596,7 +766,7 @@ async function buildIOS(projectDir: string): Promise<void> {
     `-derivedDataPath "${resolve(iosDir, 'DerivedData')}"`,
   ].join(' ');
 
-  runLive(buildCmd, { cwd: iosDir });
+  await runLive(buildCmd, { cwd: iosDir });
   log.info(`  Xcode build complete (${((Date.now() - stepStart) / 1000).toFixed(1)}s)`);
 
   // Verify the .app exists (getBinaryPath points directly at DerivedData)
@@ -627,7 +797,9 @@ async function buildAndroid(projectDir: string): Promise<void> {
   }
 
   run(`chmod +x "${gradlew}"`, { cwd: androidDir });
-  run(`"${gradlew}" assembleDebug -x lint --no-daemon`, {
+  // runLive keeps the spinner animating + lets SIGINT reach this process.
+  // run() would block the event loop for the entire multi-minute gradle run.
+  await runLive(`"${gradlew}" assembleDebug -x lint --no-daemon`, {
     cwd: androidDir,
   });
   log.info(`  Gradle build complete (${((Date.now() - gradleStart) / 1000).toFixed(1)}s)`);
