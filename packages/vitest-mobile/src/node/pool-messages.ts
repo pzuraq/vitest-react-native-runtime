@@ -32,14 +32,6 @@ export interface CancelMessage {
   __cancel: true;
 }
 
-export type AppToPoolMessage =
-  | ScreenshotRequest
-  | PauseMessage
-  | PauseEndedMessage
-  | RerunMessage
-  | CancelMessage
-  | BiRpcMessage;
-
 export interface VitestWorkerContext {
   config?: Record<string, unknown> & {
     __poolMode?: string;
@@ -47,12 +39,6 @@ export interface VitestWorkerContext {
     hookTimeout?: number;
   };
   files?: { filepath?: string }[];
-}
-
-export interface VitestWorkerRequest extends BiRpcMessage {
-  __vitest_worker_request__: true;
-  type: 'start' | 'run' | 'collect' | 'cancel' | 'stop';
-  context?: VitestWorkerContext;
 }
 
 export function isScreenshotRequest(msg: BiRpcMessage): msg is ScreenshotRequest & BiRpcMessage {

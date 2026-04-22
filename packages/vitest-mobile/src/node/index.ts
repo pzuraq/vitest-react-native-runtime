@@ -29,43 +29,6 @@ function detectMode(): PoolMode {
   return 'dev';
 }
 
-function countTestsInSpecs(specsInput: unknown): number {
-  const specs = Array.isArray(specsInput) ? specsInput : [];
-  let count = 0;
-
-  for (const spec of specs) {
-    if (!spec || typeof spec !== 'object') continue;
-    const record = spec as Record<string, unknown>;
-    const testModule = record.testModule as
-      | {
-          children?: { allTests?: () => Iterable<unknown> };
-        }
-      | undefined;
-    try {
-      const children = testModule?.children;
-      if (children && typeof children === 'object' && 'allTests' in children) {
-        const allTestsFn = (children as { allTests?: () => unknown }).allTests;
-        if (typeof allTestsFn === 'function') {
-          const result = allTestsFn.call(children);
-          if (result && typeof (result as { [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function') {
-            count += Array.from(result as Iterable<unknown>).length;
-            continue;
-          }
-        }
-      }
-    } catch {
-      // Ignore and fall back to testIds-based estimate below.
-    }
-
-    const testIds = record.testIds;
-    if (Array.isArray(testIds)) {
-      count += testIds.length;
-    }
-  }
-
-  return count;
-}
-
 /** Vite plugin that wires up the native pool worker. */
 export function nativePlugin(options: NativePluginOptions = {}): Plugin {
   const mode = detectMode();
@@ -93,24 +56,17 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
     rerunFiles?: (files: string[]) => void;
     scheduleRerun?: (files: string[]) => void;
     rerunTestSpecifications?: (files: string[]) => void;
-    config?: { reporters?: unknown[] };
   }
 
   let _singletonWorker: ReturnType<typeof createNativePoolWorker> | null = null;
   let _vitestInstance: VitestInstance | null = null;
-  let _reporterRegistered = false;
 
   function bindRerunCallback() {
     if (_singletonWorker && _vitestInstance) {
       const vitest = _vitestInstance;
       const rerunFn = vitest.rerunFiles ?? vitest.scheduleRerun ?? vitest.rerunTestSpecifications;
       const rerun = typeof rerunFn === 'function' ? rerunFn.bind(vitest) : null;
-
-      // Newer Vitest versions may not expose a direct rerun API here.
-      // In that case, keep the callback unset so pool.ts can use its
-      // built-in replay fallback when rerun is requested from the device.
       if (!rerun) return;
-
       _singletonWorker.setRerunCallback((files: string[], _pattern?: string) => {
         rerun(files);
       });
@@ -143,6 +99,15 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
       test.pool = poolRunner;
       test.maxWorkers = 1;
       test.minWorkers = 1;
+      // isolate: false tells Vitest this worker can share runtime across files.
+      // Combined with maxWorkers=1, it makes groupSpecs bundle all same-project/env
+      // specs into a single task with context.files = [all], which collapses the
+      // worker lifecycle (start → run → stop) to fire once per user-initiated run
+      // rather than once per file. The RN harness shares one JS VM across files
+      // anyway, so this matches reality.
+      if (test.isolate === undefined) {
+        test.isolate = false;
+      }
       if (!test.include) {
         test.include = DEFAULT_INCLUDE;
       }
@@ -166,37 +131,6 @@ export function nativePlugin(options: NativePluginOptions = {}): Plugin {
   plugin.configureVitest = (ctx: { vitest?: VitestInstance } & VitestInstance) => {
     _vitestInstance = ctx.vitest ?? ctx;
     bindRerunCallback();
-
-    if (_reporterRegistered) return;
-    const reporters = _vitestInstance?.config?.reporters;
-    if (!Array.isArray(reporters)) return;
-
-    reporters.push({
-      onTestRunStart(specs: unknown[]) {
-        const testCount = countTestsInSpecs(specs);
-        _singletonWorker?.sendToDevice({
-          __native_run_start: true,
-          fileCount: specs.length,
-          testCount,
-        });
-      },
-      // Returning the promise is critical: Vitest awaits reporter hooks,
-      // and teardown() is the only place we close Metro (worker farm +
-      // file watchers) and the shared WS server. If we fire-and-forget
-      // here, Vitest hits its teardownTimeout before cleanup completes
-      // and prints "Tests closed successfully but something prevents
-      // the main process from exiting".
-      async onTestRunEnd(_modules: unknown, _errors: unknown, reason: string) {
-        _singletonWorker?.sendToDevice({
-          __native_run_end: true,
-          reason,
-        });
-        if (mode === 'run') {
-          await _singletonWorker?.teardown();
-        }
-      },
-    });
-    _reporterRegistered = true;
   };
 
   return plugin;

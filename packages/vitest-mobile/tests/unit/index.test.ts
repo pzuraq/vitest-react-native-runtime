@@ -16,6 +16,7 @@ interface TestConfig extends UserConfig {
     include?: string[];
     maxWorkers?: number;
     minWorkers?: number;
+    isolate?: boolean;
     [key: string]: unknown;
   };
 }
@@ -92,6 +93,21 @@ describe('nativePlugin', () => {
     const config = applyPlugin(plugin);
     expect(config.test!.pool).toBeDefined();
     expect(typeof config.test!.pool!.createPoolWorker).toBe('function');
+  });
+
+  it('sets isolate: false and maxWorkers/minWorkers to 1 so the whole run is one task', () => {
+    const plugin = nativePlugin();
+    const config = applyPlugin(plugin);
+    expect(config.test!.isolate).toBe(false);
+    expect(config.test!.maxWorkers).toBe(1);
+    expect(config.test!.minWorkers).toBe(1);
+  });
+
+  it('does not override test.isolate when the user has already set it', () => {
+    const plugin = nativePlugin();
+    const config: TestConfig = { test: { isolate: true } };
+    (plugin.config as (c: TestConfig) => TestConfig)(config);
+    expect(config.test!.isolate).toBe(true);
   });
 
   it('sets default test.include when none is present', () => {

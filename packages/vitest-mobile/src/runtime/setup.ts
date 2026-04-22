@@ -205,6 +205,109 @@ function registerHmrRerunListener(): void {
   });
 }
 
+const DEFAULT_RUNNER_CONFIG: VitestRunnerConfig = {
+  root: '.',
+  setupFiles: [],
+  name: undefined,
+  passWithNoTests: false,
+  testNamePattern: undefined,
+  allowOnly: false,
+  sequence: { seed: 0, hooks: 'stack', setupFiles: 'list' },
+  chaiConfig: undefined,
+  maxConcurrency: 1,
+  testTimeout: 10000,
+  hookTimeout: 10000,
+  retry: 0,
+  includeTaskLocation: false,
+  tags: [],
+  tagsFilter: undefined,
+  strictTags: false,
+};
+
+interface FileHandle {
+  file: File;
+  filePath: string;
+  fileName: string;
+  registryKey: string;
+  displayPath: string;
+  moduleName: string;
+}
+
+function describeFile(file: File): FileHandle {
+  const filePath = file.filepath ?? '';
+  const fileName = filePath.split('/').pop() ?? filePath;
+  const parts = filePath.split('/');
+  const modulesIdx = parts.indexOf('modules');
+  return {
+    file,
+    filePath,
+    fileName,
+    registryKey: tryResolveRegistryKey(filePath) ?? filePath,
+    displayPath: toProjectRelativePath(filePath),
+    moduleName: modulesIdx >= 0 ? parts[modulesIdx + 1] : fileName,
+  };
+}
+
+async function runSingleFile(handle: FileHandle, config: VitestRunnerConfig): Promise<void> {
+  setStatus({
+    state: 'running',
+    message: handle.moduleName,
+    currentFile: handle.fileName,
+  });
+  emitTestEvent({ type: 'file-start', file: handle.registryKey, displayPath: handle.displayPath });
+
+  // Yield to let React render the updated progress before tests block the thread
+  await new Promise(r => setTimeout(r, 0));
+
+  let filePassed = 0;
+  let fileFailed = 0;
+
+  const runner = new ReactNativeRunner(config, vitestRpc!, test => {
+    const name = test.name ?? '?';
+    const state = test.result?.state ?? 'unknown';
+    const duration = test.result?.duration ?? 0;
+    const errMsg = test.result?.errors?.[0]?.message;
+    if (state === 'pass') {
+      passed++;
+      filePassed++;
+      addLog(`✓ ${name} (${duration}ms)`);
+    } else {
+      failed++;
+      fileFailed++;
+      addLog(`✗ ${name} (${duration}ms)\n  ${errMsg ?? 'unknown error'}`);
+    }
+    setStatus({
+      passed,
+      failed,
+      total: passed + failed,
+      message: `${handle.moduleName} — ${passed + failed} tests`,
+    });
+
+    emitTestEvent({
+      type: 'test-done',
+      file: handle.registryKey,
+      displayPath: handle.displayPath,
+      testId: test.id,
+      testName: name,
+      suitePath: getSuitePath(test),
+      state: state === 'pass' ? 'pass' : state === 'fail' ? 'fail' : 'skip',
+      duration,
+      error: errMsg,
+    });
+  });
+
+  try {
+    await startTests([handle.file], runner);
+  } finally {
+    emitTestEvent({
+      type: 'file-done',
+      file: handle.registryKey,
+      passed: filePassed,
+      failed: fileFailed,
+    });
+  }
+}
+
 async function handleRun(context: RunContext) {
   _runAbortController = new AbortController();
   const notifyPool = (msg: Record<string, unknown>) => {
@@ -214,86 +317,13 @@ async function handleRun(context: RunContext) {
   };
   configurePause({ notifyPool, abortSignal: _runAbortController.signal, mode: _poolMode });
 
-  const files = context.files;
-
-  const filePath: string = files?.[0]?.filepath ?? '';
-  const fileName = filePath.split('/').pop() ?? filePath;
-  const registryKey = tryResolveRegistryKey(filePath) ?? filePath;
-  const displayPath = toProjectRelativePath(filePath);
-  const parts = filePath.split('/');
-  const modulesIdx = parts.indexOf('modules');
-  const moduleName = modulesIdx >= 0 ? parts[modulesIdx + 1] : fileName;
-
-  setStatus({
-    state: 'running',
-    message: moduleName,
-    currentFile: fileName,
-  });
-
-  emitTestEvent({ type: 'file-start', file: registryKey, displayPath });
-
-  // Yield to let React render the updated progress before tests block the thread
-  await new Promise(r => setTimeout(r, 0));
-
-  let filePassed = 0;
-  let fileFailed = 0;
+  const files = context.files ?? [];
+  const config = storedConfig ?? context.config ?? DEFAULT_RUNNER_CONFIG;
 
   try {
-    const config = storedConfig ??
-      context.config ?? {
-        root: '.',
-        setupFiles: [],
-        name: undefined,
-        passWithNoTests: false,
-        testNamePattern: undefined,
-        allowOnly: false,
-        sequence: { seed: 0, hooks: 'stack', setupFiles: 'list' },
-        chaiConfig: undefined,
-        maxConcurrency: 1,
-        testTimeout: 10000,
-        hookTimeout: 10000,
-        retry: 0,
-        includeTaskLocation: false,
-        tags: [],
-        tagsFilter: undefined,
-        strictTags: false,
-      };
-
-    const runner = new ReactNativeRunner(config as VitestRunnerConfig, vitestRpc!, test => {
-      const name = test.name ?? '?';
-      const state = test.result?.state ?? 'unknown';
-      const duration = test.result?.duration ?? 0;
-      const errMsg = test.result?.errors?.[0]?.message;
-      if (state === 'pass') {
-        passed++;
-        filePassed++;
-        addLog(`✓ ${name} (${duration}ms)`);
-      } else {
-        failed++;
-        fileFailed++;
-        addLog(`✗ ${name} (${duration}ms)\n  ${errMsg ?? 'unknown error'}`);
-      }
-      setStatus({
-        passed,
-        failed,
-        total: passed + failed,
-        message: `${moduleName} — ${passed + failed} tests`,
-      });
-
-      emitTestEvent({
-        type: 'test-done',
-        file: registryKey,
-        displayPath,
-        testId: test.id,
-        testName: name,
-        suitePath: getSuitePath(test),
-        state: state === 'pass' ? 'pass' : state === 'fail' ? 'fail' : 'skip',
-        duration,
-        error: errMsg,
-      });
-    });
-
-    await startTests(files ?? [], runner);
+    for (const file of files) {
+      await runSingleFile(describeFile(file), config as VitestRunnerConfig);
+    }
   } catch (err: unknown) {
     if (err instanceof Error && err.name === 'AbortError') {
       // Run aborted — new run starting
@@ -318,13 +348,6 @@ async function handleRun(context: RunContext) {
     _runAbortController = null;
   }
 
-  emitTestEvent({
-    type: 'file-done',
-    file: registryKey,
-    passed: filePassed,
-    failed: fileFailed,
-  });
-
   await new Promise(r => setTimeout(r, 100));
   sendResponse({ type: 'testfileFinished' });
 }
@@ -334,25 +357,7 @@ async function handleCollect(context: RunContext) {
   setStatus({ state: 'running', message: `Collecting ${files?.length ?? 0} file(s)...` });
 
   try {
-    const config = storedConfig ??
-      context.config ?? {
-        root: '.',
-        setupFiles: [],
-        name: undefined,
-        passWithNoTests: true,
-        testNamePattern: undefined,
-        allowOnly: false,
-        sequence: { seed: 0, hooks: 'stack', setupFiles: 'list' },
-        chaiConfig: undefined,
-        maxConcurrency: 1,
-        testTimeout: 10000,
-        hookTimeout: 10000,
-        retry: 0,
-        includeTaskLocation: false,
-        tags: [],
-        tagsFilter: undefined,
-        strictTags: false,
-      };
+    const config = storedConfig ?? context.config ?? { ...DEFAULT_RUNNER_CONFIG, passWithNoTests: true };
     const runner = new ReactNativeRunner(config as VitestRunnerConfig, vitestRpc!);
     await collectTests(files ?? [], runner);
   } catch (err: unknown) {

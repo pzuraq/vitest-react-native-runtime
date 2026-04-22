@@ -190,6 +190,69 @@ describe('createNativePoolWorker lifecycle (mocked device / Metro / binary)', ()
     expect(msg).toMatchObject({ type: 'test' });
   });
 
+  it('forwards a batched run request with all files in a single WebSocket frame', async () => {
+    const port = await reservePort();
+    metroPort = await reservePort();
+    worker = createNativePoolWorker(poolOptions(port, metroPort, appDir));
+
+    worker.start();
+    const ws = await connectWs(port);
+    clients.push(ws);
+    await new Promise(r => setTimeout(r, 200));
+
+    // Frames are a mix of plain-JSON device-facing messages (__native_run_start)
+    // and flatted BiRpc messages (the run request). Try each parser in turn and
+    // ignore malformed frames.
+    const parseAny = (raw: string): unknown => {
+      try {
+        return flatParse(raw);
+      } catch {
+        try {
+          return JSON.parse(raw);
+        } catch {
+          return null;
+        }
+      }
+    };
+
+    const seenFrames: string[] = [];
+    const runReceived = new Promise<{ type: string; context: { files: { filepath: string }[] } }>(resolve => {
+      ws.on('message', data => {
+        const raw = data.toString();
+        seenFrames.push(raw);
+        const parsed = parseAny(raw) as { type?: string; context?: { files?: { filepath: string }[] } } | null;
+        if (parsed?.type === 'run') {
+          resolve(parsed as { type: string; context: { files: { filepath: string }[] } });
+        }
+      });
+    });
+
+    worker.send({
+      __vitest_worker_request__: true,
+      type: 'start',
+      context: { config: {} },
+    } as unknown as Parameters<typeof worker.send>[0]);
+
+    worker.send({
+      __vitest_worker_request__: true,
+      type: 'run',
+      context: {
+        files: [{ filepath: '/abs/a.test.ts' }, { filepath: '/abs/b.test.ts' }, { filepath: '/abs/c.test.ts' }],
+      },
+    } as unknown as Parameters<typeof worker.send>[0]);
+
+    const runMsg = await runReceived;
+    expect(runMsg.type).toBe('run');
+    expect(runMsg.context.files.map(f => f.filepath)).toEqual(['/abs/a.test.ts', '/abs/b.test.ts', '/abs/c.test.ts']);
+
+    // Only one run frame was sent — the pool must not split the batch per-file.
+    const runFrameCount = seenFrames.filter(f => {
+      const parsed = parseAny(f) as { type?: string } | null;
+      return parsed?.type === 'run';
+    }).length;
+    expect(runFrameCount).toBe(1);
+  });
+
   it('on/off correctly adds and removes listeners', async () => {
     const port = await reservePort();
     metroPort = await reservePort();
@@ -215,7 +278,7 @@ describe('createNativePoolWorker lifecycle (mocked device / Metro / binary)', ()
     expect(received.length).toBe(countAfterOn);
   });
 
-  it('stop() emits a stopped worker response on message', async () => {
+  it('handshake: a {type:stop} request synchronously emits a stopped response', async () => {
     const port = await reservePort();
     metroPort = await reservePort();
     worker = createNativePoolWorker(poolOptions(port, metroPort, appDir));
@@ -232,14 +295,41 @@ describe('createNativePoolWorker lifecycle (mocked device / Metro / binary)', ()
       });
     });
 
-    await worker.stop();
+    worker.send({
+      __vitest_worker_request__: true,
+      type: 'stop',
+    } as unknown as Parameters<typeof worker.send>[0]);
+
     const msg = await stopped;
-    expect(msg).toEqual(
-      expect.objectContaining({
-        __vitest_worker_response__: true,
-        type: 'stopped',
-      }),
-    );
+    expect(msg).toEqual(expect.objectContaining({ __vitest_worker_response__: true, type: 'stopped' }));
+  });
+
+  it('teardown: worker.stop() in run mode notifies the device with __native_run_end', async () => {
+    const port = await reservePort();
+    metroPort = await reservePort();
+    worker = createNativePoolWorker(poolOptions(port, metroPort, appDir));
+
+    worker.start();
+    const ws = await connectWs(port);
+    clients.push(ws);
+    await new Promise(r => setTimeout(r, 200));
+
+    const endSeen = new Promise<Record<string, unknown>>(resolve => {
+      ws.on('message', data => {
+        const raw = data.toString();
+        // __native_run_end is plain JSON, not flatted birpc.
+        try {
+          const parsed = JSON.parse(raw) as Record<string, unknown>;
+          if (parsed?.__native_run_end === true) resolve(parsed);
+        } catch {
+          /* not JSON (could be flatted) — ignore */
+        }
+      });
+    });
+
+    await worker.stop();
+    const msg = await endSeen;
+    expect(msg).toMatchObject({ __native_run_end: true });
     worker = null;
   });
 });

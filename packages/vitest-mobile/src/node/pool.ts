@@ -5,6 +5,16 @@
  *   dev  (vitest --watch) — visible emulator, reuse app/Metro, leave running
  *   run  (vitest run)     — headless, clean start, shut down after
  *
+ * The plugin sets `test.isolate = false` and `maxWorkers = 1`, which makes
+ * Vitest's scheduler bundle every file in a run into a single task with
+ * `context.files = [all]`. So `worker.start()`/`worker.stop()` fire once per
+ * user-initiated run (initial run or HMR-driven rerun), not once per file.
+ * Per-file granularity happens inside the device-side handleRun loop.
+ *
+ * The singleton worker persists across reruns, so cross-rerun idempotency
+ * (_startPromise, _startConfigSent) is still required to avoid re-booting
+ * the device on every HMR cycle.
+ *
  * Metro is started programmatically via metro-runner.ts. The harness binary
  * is auto-built and cached by harness-builder.ts. Test files are discovered
  * from vitest include patterns and exposed via a generated test registry.
@@ -172,7 +182,6 @@ export function createNativePoolWorker(options: NativePoolOptions) {
   if (options.verbose) setVerbose(true);
 
   const listeners = new Map<string, Set<EventCallback>>();
-  const listenerWrappers = new Map<EventCallback, EventCallback>();
 
   log.verbose(`Mode: ${mode} | Headless: ${headless} | Platform: ${platform}`);
 
@@ -182,17 +191,20 @@ export function createNativePoolWorker(options: NativePoolOptions) {
 
   let _connectedSocket: WebSocket | null = null;
   let _resolveConnection: (() => void) | null = null;
-  let _hasCompletedCycle = false;
   let _startPromise: Promise<void> | null = null;
   let _startComplete = false;
   let _metroRunner: MetroRunnerServer | null = null;
   let _harnessProjectDir: string | undefined;
   let _rerunCallback: ((files: string[], pattern?: string) => void) | null = null;
-  const _lastRunMessages = new Map<string, BiRpcMessage>();
+  // Registry-key (e.g. "projectName/foo.test.ts") → absolute filepath. Populated
+  // when forwarding a 'run' message; used to resolve device-sent rerun requests.
   const _registryToAbsPath = new Map<string, string>();
-  let _sessionCount = 0;
+  // Absolute filepaths of the files in the most recent run. Used to trigger an
+  // automatic rerun when the app reconnects after a reload.
+  const _lastRunFiles = new Set<string>();
   let _instanceRegistered = false;
   let _startConfigSent = false;
+  let _runTeardownDone = false;
 
   function waitForApp(timeoutMs = appConnectTimeout): Promise<void> {
     return new Promise((resolvePromise, reject) => {
@@ -243,8 +255,13 @@ export function createNativePoolWorker(options: NativePoolOptions) {
   process.once('SIGTERM', onSignal);
 
   function emit(event: string, data: unknown): void {
-    const cbs = listeners.get(event);
-    if (cbs) cbs.forEach(cb => cb(data));
+    if (event === 'message') {
+      const msg = data as BiRpcMessage;
+      if (msg?.m === 'onCollected') {
+        log.verbose(`onCollected: ${(msg?.a?.[0] as unknown[] | undefined)?.length} file(s)`);
+      }
+    }
+    listeners.get(event)?.forEach(cb => cb(data));
   }
 
   // ── Test registry generation ───────────────────────────────────
@@ -307,18 +324,17 @@ export function createNativePoolWorker(options: NativePoolOptions) {
       return;
     }
 
-    const isReconnect = _hasCompletedCycle;
+    // A non-empty _lastRunFiles means we've completed a run before — so this
+    // socket is a reconnect (e.g. harness code changed → Metro HMR →
+    // DevSettings.reload()) and we should replay the last file set.
+    const isReconnect = _lastRunFiles.size > 0;
     log.info(`${platform} app ${isReconnect ? 'reconnected' : 'connected'}`);
     _connectedSocket = socket;
 
-    // If the app reconnected after a completed test cycle (e.g. harness code
-    // changed → Metro HMR → DevSettings.reload()), rerun all tests.
     if (isReconnect && _rerunCallback) {
-      const testFiles = Array.from(_lastRunMessages.keys()).filter(k => k.startsWith('/'));
-      if (testFiles.length > 0) {
-        log.info('Triggering rerun after app reload...');
-        setTimeout(() => _rerunCallback?.(testFiles), 500);
-      }
+      log.info('Triggering rerun after app reload...');
+      const files = Array.from(_lastRunFiles);
+      setTimeout(() => _rerunCallback?.(files), 500);
     }
 
     socket.on('message', async (data: Buffer) => {
@@ -343,35 +359,11 @@ export function createNativePoolWorker(options: NativePoolOptions) {
           return;
         }
         if (isRerunMessage(msg)) {
-          const label = (msg.label as string | undefined) ?? 'unknown';
           const files = msg.files as string[] | undefined;
           const pattern = msg.testNamePattern as string | undefined;
-
           if (_rerunCallback && files?.length) {
             const resolved = files.map(f => _registryToAbsPath.get(f) ?? f);
             _rerunCallback(resolved, pattern);
-          } else if (files?.length && _connectedSocket) {
-            log.info(
-              pc.cyan(`↻ Rerun from device: ${label}`) +
-                (files?.length ? ` (${files.length} file${files.length > 1 ? 's' : ''})` : '') +
-                (pattern ? ` [pattern: ${pattern}]` : ''),
-            );
-            const toReplay = new Set<BiRpcMessage>();
-            for (const f of files) {
-              const stored = _lastRunMessages.get(f);
-              if (stored) toReplay.add(stored);
-            }
-            if (toReplay.size > 0) {
-              worker.sendToDevice({
-                __native_run_start: true,
-                fileCount: toReplay.size,
-              });
-              for (const message of toReplay) {
-                _connectedSocket.send(flatStringify(message));
-              }
-            } else {
-              log.warn('  No stored run messages to replay');
-            }
           }
           return;
         }
@@ -545,7 +537,9 @@ export function createNativePoolWorker(options: NativePoolOptions) {
       }
       if (skipIfUnavailable) {
         log.warn('Skipping native tests (skipIfUnavailable)\n');
-        emit('message', { __vitest_worker_response__: true, type: 'started' });
+        // The 'start' handshake is already answered synchronously in send();
+        // just return so _startComplete flips true and run/collect fail fast
+        // with "RN app not connected" instead of hanging.
         return;
       }
       throw new Error('Environment not ready. See above for setup instructions.');
@@ -721,27 +715,22 @@ export function createNativePoolWorker(options: NativePoolOptions) {
     name: 'native' as const,
     reportMemory: false,
 
+    // The native runtime can run any task that made it through isolate:false
+    // pre-checks (same project, same env). Returning true short-circuits the
+    // default isEnvironmentEqual() check — harmless in the maxWorkers=1 world
+    // today, useful if we ever want parallel devices sharing one pool.
+    canReuse(): boolean {
+      return true;
+    },
+
     on(event: string, callback: EventCallback): void {
-      const wrappedCb: EventCallback = data => {
-        if (event === 'message') {
-          const msg = data as BiRpcMessage;
-          if (msg?.m === 'onCollected') {
-            log.verbose(`onCollected: ${(msg?.a?.[0] as unknown[] | undefined)?.length} file(s)`);
-          }
-        }
-        callback(data);
-      };
-      listenerWrappers.set(callback, wrappedCb);
-      if (!listeners.has(event)) listeners.set(event, new Set());
-      listeners.get(event)!.add(wrappedCb);
+      let set = listeners.get(event);
+      if (!set) listeners.set(event, (set = new Set()));
+      set.add(callback);
     },
 
     off(event: string, callback: EventCallback): void {
-      const wrapped = listenerWrappers.get(callback);
-      if (wrapped) {
-        listeners.get(event)?.delete(wrapped);
-        listenerWrappers.delete(callback);
-      }
+      listeners.get(event)?.delete(callback);
     },
 
     deserialize(data: unknown): unknown {
@@ -749,13 +738,12 @@ export function createNativePoolWorker(options: NativePoolOptions) {
     },
 
     async start(): Promise<void> {
+      // doStart() can outlast Vitest's WORKER_START_TIMEOUT (90s) on a cold
+      // simulator, so we resolve start() immediately and queue run/collect
+      // behind _startComplete instead. A ref'd keepAlive keeps the event
+      // loop open while device bring-up runs (everything else we create is
+      // .unref()'d so process shutdown stays clean).
       if (!_startPromise) {
-        // Every server/timer in this pool is unref'd so the harness doesn't
-        // wedge shutdown after a run. That means once start() resolves, Node
-        // has no event-loop holders of its own — if we awaited _startPromise
-        // the process would exit cleanly before any test fired. Hold the
-        // loop open ourselves with a ref'd heartbeat interval that runs for
-        // the duration of device bring-up and is cleared when we're ready.
         const keepAlive = setInterval(() => {}, 30_000);
         _startPromise = doStart()
           .then(() => {
@@ -764,40 +752,26 @@ export function createNativePoolWorker(options: NativePoolOptions) {
           .finally(() => clearInterval(keepAlive));
         _startPromise.catch(e => log.error('Startup failed:', e));
       }
-      // Return immediately — do NOT await _startPromise. Device bring-up
-      // (simctl boot, install, app launch, bundle load, WS handshake) can
-      // take much longer than vitest's WORKER_START_TIMEOUT (90s), especially
-      // on a cold-boot iOS 26+ simulator. The `send()` handlers defer
-      // 'collect' and 'run' until `_startComplete`, so we don't need start()
-      // to block the worker lifecycle — clearing vitest's internal timeout
-      // via a quick resolution is enough.
     },
 
+    // Phase 2 of runner.stop(): the imperative teardown. Called once per
+    // runner.stop() via `await this.worker.stop()` after the handshake.
+    // Runs inside pool.exitPromises → awaited by Vitest.close(), so any
+    // async work here gates process exit and the hanging-process warning.
     async stop(): Promise<void> {
-      _hasCompletedCycle = true;
-      _sessionCount++;
-      if (_instanceRegistered) {
-        releaseInstanceRecord(appDir, instanceId);
-        _instanceRegistered = false;
+      _connectedSocket?.send(JSON.stringify({ __native_run_end: true }));
+      if (mode === 'run') {
+        if (_runTeardownDone) return;
+        _runTeardownDone = true;
+        process.removeListener('SIGINT', onSignal);
+        process.removeListener('SIGTERM', onSignal);
+        await cleanup();
+        await closeServer();
       }
-      emit('message', { __vitest_worker_response__: true, type: 'stopped' });
     },
 
     setRerunCallback(cb: (files: string[], pattern?: string) => void): void {
       _rerunCallback = cb;
-    },
-
-    sendToDevice(msg: Record<string, unknown>): void {
-      if (_connectedSocket) {
-        _connectedSocket.send(JSON.stringify(msg));
-      }
-    },
-
-    async teardown(): Promise<void> {
-      process.removeListener('SIGINT', onSignal);
-      process.removeListener('SIGTERM', onSignal);
-      await cleanup();
-      await closeServer();
     },
 
     send(message: BiRpcMessage): void {
@@ -805,34 +779,30 @@ export function createNativePoolWorker(options: NativePoolOptions) {
         const ctx = (message as BiRpcMessage & { context?: VitestWorkerContext }).context;
         switch (message.type) {
           case 'start': {
-            if (mode === 'dev' && ctx?.config) {
-              ctx.config.testTimeout = 0;
-              ctx.config.hookTimeout = 0;
-              ctx.config.__poolMode = 'dev';
-            } else if (ctx?.config) {
-              ctx.config.__poolMode = 'run';
+            if (ctx?.config) {
+              ctx.config.__poolMode = mode;
+              // Force config.root to appDir. On the RN runtime, Vitest's
+              // serialized root sometimes arrives as '/' (the RN VM's notion
+              // of cwd), which would make createFileTask emit absolute-minus-
+              // slash paths like "Users/.../test.tsx" via relative('/', abs).
+              // appDir is always the Node-side project root, which is what the
+              // reporter expects for its relative-path display.
+              ctx.config.root = appDir;
+              if (mode === 'dev') {
+                ctx.config.testTimeout = 0;
+                ctx.config.hookTimeout = 0;
+              }
             }
-
-            // Respond to vitest immediately — the 'start' message is a
-            // worker lifecycle handshake with a 60s timeout (START_TIMEOUT
-            // in vitest). Device startup (simulator boot, app launch) can
-            // take longer than that, but we don't need the device for the
-            // handshake. run/collect already defer until _startComplete.
+            // Answer the 60s START_TIMEOUT handshake without waiting on the
+            // device — run/collect handlers defer until _startComplete.
             emit('message', { __vitest_worker_response__: true, type: 'started' });
-
-            // Forward config to the device once per session so it has the
-            // correct root for file-hash ID generation. Only the first
-            // start carries the config; subsequent per-file starts are
-            // skipped to avoid repeated invalidateAllTestModules() calls.
+            // Forward the serialized config to the device only once per
+            // process: it triggers invalidateAllTestModules() on the device.
             if (!_startConfigSent) {
               _startConfigSent = true;
-              if (_connectedSocket) {
-                _connectedSocket.send(flatStringify(message));
-              } else if (_startPromise) {
-                _startPromise.then(() => {
-                  if (_connectedSocket) _connectedSocket.send(flatStringify(message));
-                });
-              }
+              const forward = () => _connectedSocket?.send(flatStringify(message));
+              if (_connectedSocket) forward();
+              else _startPromise?.then(forward);
             }
             break;
           }
@@ -847,22 +817,24 @@ export function createNativePoolWorker(options: NativePoolOptions) {
             }
             const files = ctx?.files;
             if (files?.length && message.type === 'run') {
+              _lastRunFiles.clear();
               for (const f of files) {
-                if (f.filepath) {
-                  _lastRunMessages.set(f.filepath, message);
-                  const fname = f.filepath.split('/').pop() ?? f.filepath;
-                  _lastRunMessages.set(fname, message);
-                  _registryToAbsPath.set(fname, f.filepath);
-                  const parts = f.filepath.split('/');
-                  const testsIdx = parts.indexOf('tests');
-                  if (testsIdx >= 1) {
-                    const registryKey = `${parts[testsIdx - 1]}/${parts[parts.length - 1]}`;
-                    _lastRunMessages.set(registryKey, message);
-                    _registryToAbsPath.set(registryKey, f.filepath);
-                  }
+                if (!f.filepath) continue;
+                _lastRunFiles.add(f.filepath);
+                // Register the "projectName/filename" registry key so device-sent
+                // rerun requests (which use that short form) can resolve back.
+                const parts = f.filepath.split('/');
+                const testsIdx = parts.indexOf('tests');
+                if (testsIdx >= 1) {
+                  const registryKey = `${parts[testsIdx - 1]}/${parts[parts.length - 1]}`;
+                  _registryToAbsPath.set(registryKey, f.filepath);
                 }
               }
-              log.info(files.map(f => pc.cyan(f.filepath?.split('/').pop() ?? '')).join(', '));
+              // Vitest's reporter already prints a per-file line as each
+              // finishes; logging the full list up front is noisy. Keep it in
+              // verbose mode for debugging.
+              log.verbose(files.map(f => f.filepath?.split('/').pop() ?? '').join(', '));
+              _connectedSocket?.send(JSON.stringify({ __native_run_start: true, fileCount: files.length }));
             }
             if (_connectedSocket) {
               _connectedSocket.send(flatStringify(message));
@@ -879,7 +851,11 @@ export function createNativePoolWorker(options: NativePoolOptions) {
             if (_connectedSocket) _connectedSocket.send(flatStringify(message));
             break;
           case 'stop':
-            this.stop();
+            // Phase 1 of runner.stop(): the cooperative handshake. Reply
+            // synchronously so Vitest's 60s STOP_TIMEOUT never bites. The
+            // real teardown happens later in worker.stop() when the runner
+            // calls it directly (awaited via pool.exitPromises).
+            emit('message', { __vitest_worker_response__: true, type: 'stopped' });
             break;
         }
         return;
