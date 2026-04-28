@@ -73,6 +73,7 @@ export function withDefaults(
   const resolvedMetro: ResolvedMetroOptions = {
     bundle: metro.bundle,
     customize: metro.customize,
+    babelPlugins: metro.babelPlugins ?? [],
   };
 
   const resolvedOptions: ResolvedNativePluginOptions = {

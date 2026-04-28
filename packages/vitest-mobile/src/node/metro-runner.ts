@@ -94,6 +94,8 @@ export interface MetroRunnerOptions {
    * config before vitest-mobile's test-specific overrides are applied.
    */
   metro?: MetroConfigCustomizer;
+  /** Extra Babel plugin specifiers to inject into Metro's transform pipeline. */
+  babelPlugins?: string[];
 }
 
 export interface MetroServer {
@@ -233,6 +235,7 @@ export async function prepareMetroConfig(options: MetroRunnerOptions): Promise<P
     port: metroPort,
     outputDir,
     harnessProjectDir: options.harnessProjectDir,
+    babelPlugins: options.babelPlugins ?? [],
   });
   const entryPath = resolve(outputDir, `index.${options.platform}.js`);
 
@@ -268,6 +271,7 @@ export async function startMetroServer(
     outputDir: internal.outputDir,
     harnessProjectDir: runtime.harnessProjectDir,
     metro: options.metro.customize,
+    babelPlugins: options.metro.babelPlugins,
   });
   const { appDir: projectRoot } = internal;
   const port = runtime.metroPort;
@@ -453,6 +457,8 @@ export interface BuildBundleOptions {
    * the vitest config automatically, so you rarely need to set it directly.
    */
   metro?: MetroConfigCustomizer;
+  /** Extra Babel plugin specifiers to inject into Metro's transform pipeline. */
+  babelPlugins?: string[];
 }
 
 export async function buildBundle(options: BuildBundleOptions): Promise<BundleManifest> {
@@ -494,6 +500,7 @@ export async function buildBundle(options: BuildBundleOptions): Promise<BundleMa
       testPatterns,
       harnessProjectDir: harnessResult.projectDir,
       metro: options.metro,
+      babelPlugins: options.babelPlugins ?? [],
     });
 
     const baseName = `index.${platform}.jsbundle`;
@@ -665,12 +672,37 @@ function generateEntryPoint(opts: {
  * the upstream transformer is always found at the correct harness-pinned
  * version regardless of consumer hoisting.
  */
+/**
+ * Resolve user-supplied Babel plugin specifiers from the harness tree's
+ * `node_modules`. Returns absolute paths that the transformer shim can
+ * `require()` directly. Specifiers that fail to resolve are logged and
+ * skipped — e.g. if the user declares a plugin whose package isn't in
+ * `harness.nativeModules`.
+ */
+function resolveBabelPlugins(harnessProjectDir: string, pluginSpecifiers: string[]): string[] {
+  if (pluginSpecifiers.length === 0) return [];
+  const anchor = resolve(harnessProjectDir, 'package.json');
+  const req = createRequire(anchor);
+  const paths: string[] = [];
+  for (const spec of pluginSpecifiers) {
+    try {
+      paths.push(req.resolve(spec));
+    } catch {
+      log.warn(
+        `Could not resolve babel plugin '${spec}' from harness tree — skipping. Make sure the providing package is listed in harness.nativeModules.`,
+      );
+    }
+  }
+  return paths;
+}
+
 function generateTransformerShim(opts: {
   outputDir: string;
   harnessProjectDir: string;
   testWrapperPluginPath: string;
   vitestCompatPluginPath: string;
   inlineAppRootPluginPath: string;
+  extraBabelPluginPaths?: string[];
 }): string {
   const transformerPath = resolve(opts.outputDir, 'transformer.cjs');
   const content = renderNodeTemplate('transformer.cjs', {
@@ -678,6 +710,7 @@ function generateTransformerShim(opts: {
     TEST_WRAPPER_PLUGIN_PATH: opts.testWrapperPluginPath,
     VITEST_COMPAT_PLUGIN_PATH: opts.vitestCompatPluginPath,
     INLINE_APP_ROOT_PLUGIN_PATH: opts.inlineAppRootPluginPath,
+    EXTRA_BABEL_PLUGINS_JSON: JSON.stringify(opts.extraBabelPluginPaths ?? []),
   });
   writeFileSync(transformerPath, content);
   return transformerPath;
@@ -694,6 +727,7 @@ function applyTestTransforms(
     port: number;
     outputDir: string;
     harnessProjectDir: string;
+    babelPlugins: string[];
   },
 ): ConfigT {
   const { projectRoot, outputDir, harnessProjectDir } = options;
@@ -769,12 +803,14 @@ function applyTestTransforms(
   const testWrapperPluginPath = pkgRequire.resolve('vitest-mobile/babel-plugin');
   const vitestCompatPluginPath = pkgRequire.resolve('vitest-mobile/vitest-compat-plugin');
   const inlineAppRootPluginPath = pkgRequire.resolve('vitest-mobile/inline-app-root-plugin');
+  const extraBabelPluginPaths = resolveBabelPlugins(harnessProjectDir, options.babelPlugins);
   const transformerPath = generateTransformerShim({
     outputDir,
     harnessProjectDir,
     testWrapperPluginPath,
     vitestCompatPluginPath,
     inlineAppRootPluginPath,
+    extraBabelPluginPaths,
   });
 
   return {
