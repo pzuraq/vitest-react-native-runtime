@@ -26,6 +26,12 @@ const testWrapperPlugin = loadPlugin(TEST_WRAPPER_PLUGIN_PATH);
 const vitestCompatPlugin = loadPlugin(VITEST_COMPAT_PLUGIN_PATH);
 const inlineAppRootPlugin = loadPlugin(INLINE_APP_ROOT_PLUGIN_PATH);
 
+// Babel plugins required by native modules (e.g. react-native-reanimated/plugin).
+// Resolved from the harness tree at config time and injected here so Metro's
+// live bundling (watch mode) applies them without needing a user-side .babelrc.
+const EXTRA_BABEL_PLUGIN_PATHS = JSON.parse('{{EXTRA_BABEL_PLUGINS_JSON}}');
+const extraBabelPlugins = EXTRA_BABEL_PLUGIN_PATHS.map(loadPlugin);
+
 // Mix plugin-file mtimes — and the inlined app-root value — into our cache
 // key so edits to the plugins, or a different project's app root, invalidate
 // Metro's transform cache. Without this, Metro happily reuses pre-plugin
@@ -36,6 +42,7 @@ function pluginSignature() {
       String(fs.statSync(TEST_WRAPPER_PLUGIN_PATH).mtimeMs),
       String(fs.statSync(VITEST_COMPAT_PLUGIN_PATH).mtimeMs),
       String(fs.statSync(INLINE_APP_ROOT_PLUGIN_PATH).mtimeMs),
+      ...EXTRA_BABEL_PLUGIN_PATHS.map(p => String(fs.statSync(p).mtimeMs)),
       String(process.env.VITEST_MOBILE_APP_ROOT || ''),
       String(process.env.VITEST_MOBILE_TEST_PATTERN_SOURCE || ''),
     ].join(':');
@@ -56,7 +63,16 @@ exports.transform = function (props) {
       // inlineAppRootPlugin runs first so `process.env.VITEST_MOBILE_APP_ROOT`
       // becomes a string literal before Metro's collectDependencies pass
       // analyzes the require.context() call site in test-context.cjs.
-      plugins: [inlineAppRootPlugin, ...(props.plugins || []), testWrapperPlugin, vitestCompatPlugin],
+      // extraBabelPlugins (e.g. react-native-reanimated/plugin) run before
+      // vitest-mobile's own plugins so worklet transforms etc. are applied
+      // before the test wrapper inspects the output.
+      plugins: [
+        inlineAppRootPlugin,
+        ...extraBabelPlugins,
+        ...(props.plugins || []),
+        testWrapperPlugin,
+        vitestCompatPlugin,
+      ],
     }),
   );
 };

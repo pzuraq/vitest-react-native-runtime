@@ -124,8 +124,10 @@ async function readNativeModulesFromConfig(
     if (name && !platforms.includes(name as Platform)) continue;
     for (const plugin of project.plugins ?? []) {
       if (!plugin || typeof plugin !== 'object') continue;
-      const stored = (plugin as Record<string, unknown>)[OPTIONS_KEY] as { nativeModules?: string[] } | undefined;
-      for (const mod of stored?.nativeModules ?? []) {
+      const stored = (plugin as Record<string, unknown>)[OPTIONS_KEY] as
+        | { harness?: { nativeModules?: string[] }; nativeModules?: string[] }
+        | undefined;
+      for (const mod of stored?.harness?.nativeModules ?? stored?.nativeModules ?? []) {
         modules.add(mod);
       }
     }
@@ -198,6 +200,42 @@ async function readMetroCustomizerFromConfig(
     }
     return current;
   };
+}
+
+async function readBabelPluginsFromConfig(
+  projectRoot: string,
+  platforms: Platform[],
+  configPath?: string,
+): Promise<string[]> {
+  const configFile = resolveVitestConfigFile(projectRoot, configPath);
+  if (!configFile) return [];
+
+  const config = (await loadVitestConfig(configFile, projectRoot)) as {
+    test?: {
+      projects?: Array<{
+        test?: { name?: string };
+        plugins?: unknown[];
+      }>;
+    };
+  } | null;
+  if (!config) return [];
+
+  const { VITEST_MOBILE_PLUGIN_OPTIONS_KEY: OPTIONS_KEY } = await import('../node/index');
+  const plugins = new Set<string>();
+  for (const project of config.test?.projects ?? []) {
+    const name = project.test?.name;
+    if (name && !platforms.includes(name as Platform)) continue;
+    for (const plugin of project.plugins ?? []) {
+      if (!plugin || typeof plugin !== 'object') continue;
+      const stored = (plugin as Record<string, unknown>)[OPTIONS_KEY] as
+        | { metro?: { babelPlugins?: string[] } }
+        | undefined;
+      for (const bp of stored?.metro?.babelPlugins ?? []) {
+        plugins.add(bp);
+      }
+    }
+  }
+  return [...plugins];
 }
 
 const cli = cac('vitest-mobile');
@@ -351,6 +389,7 @@ cli
       }
       const nativeModules = await resolveNativeModules(options.nativeModules, process.cwd(), platforms, options.config);
       const metro = await readMetroCustomizerFromConfig(process.cwd(), platforms, options.config);
+      const babelPlugins = await readBabelPluginsFromConfig(process.cwd(), platforms, options.config);
       await withSpinner(
         {
           command: 'bundle',
@@ -368,6 +407,7 @@ cli
             dev: options.dev,
             nativeModules,
             metro,
+            babelPlugins,
           });
         },
       );

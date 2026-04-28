@@ -408,8 +408,43 @@ async function customizeProject(projectDir: string, options: HarnessBuildOptions
 
   writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
 
+  injectBabelPluginsForNativeModules(projectDir, options.nativeModules);
+
   log.info('Installing dependencies... (this may take a minute)');
   const depsStart = Date.now();
   await runLive('npm install', { cwd: projectDir });
   log.info(`  Dependencies installed (${((Date.now() - depsStart) / 1000).toFixed(1)}s)`);
+}
+
+/**
+ * Native modules that require a corresponding Babel plugin to be added to
+ * the harness project's `babel.config.js`. Map from npm package name to the
+ * Babel plugin specifier that should be added. If a user declares one of
+ * these as a `nativeModule`, we automatically append the plugin so Metro's
+ * live bundling (watch mode) produces correct output — without it, worklet
+ * directives and similar compile-time transforms are silently skipped.
+ */
+const NATIVE_MODULE_BABEL_PLUGINS: Record<string, string> = {
+  'react-native-reanimated': 'react-native-reanimated/plugin',
+};
+
+function injectBabelPluginsForNativeModules(projectDir: string, nativeModules: string[]): void {
+  const pluginsToAdd = nativeModules
+    .filter(mod => mod in NATIVE_MODULE_BABEL_PLUGINS)
+    .map(mod => NATIVE_MODULE_BABEL_PLUGINS[mod]);
+
+  if (pluginsToAdd.length === 0) return;
+
+  const babelConfigPath = resolve(projectDir, 'babel.config.js');
+  if (!existsSync(babelConfigPath)) return;
+
+  let content = readFileSync(babelConfigPath, 'utf8');
+  for (const plugin of pluginsToAdd) {
+    if (content.includes(plugin)) continue;
+    content = content.replace(/plugins:\s*\[/, `plugins: [\n    '${plugin}',`);
+    if (!content.includes(plugin)) {
+      content = content.replace(/presets:\s*\[([^\]]*)\]/, `presets: [$1],\n  plugins: ['${plugin}']`);
+    }
+  }
+  writeFileSync(babelConfigPath, content);
 }

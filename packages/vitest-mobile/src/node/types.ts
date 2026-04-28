@@ -86,6 +86,25 @@ export interface MetroOptions {
    * See {@link NativePluginOptions.metro} for details.
    */
   customize?: MetroConfigCustomizer;
+  /**
+   * Extra Babel plugins to inject into Metro's transform pipeline. These are
+   * applied to every file Metro bundles, both in watch mode (live Metro) and
+   * when building pre-built bundles.
+   *
+   * Use this for native modules that require a compile-time Babel transform,
+   * such as `react-native-reanimated/plugin`. Plugins are resolved from the
+   * harness project's `node_modules` (where your `harness.nativeModules`
+   * are installed).
+   *
+   * @example
+   * ```ts
+   * nativePlugin({
+   *   harness: { nativeModules: ['react-native-reanimated'] },
+   *   metro: { babelPlugins: ['react-native-reanimated/plugin'] },
+   * })
+   * ```
+   */
+  babelPlugins?: string[];
 }
 
 // ── User-facing plugin options ─────────────────────────────────────
@@ -129,6 +148,7 @@ export interface ResolvedDeviceOptions {
 export interface ResolvedMetroOptions {
   bundle: boolean | string | undefined;
   customize: MetroConfigCustomizer | undefined;
+  babelPlugins: string[];
 }
 
 /** Pool options after `withDefaults` — frozen, every field concrete. */
