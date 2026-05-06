@@ -23,3 +23,6 @@ binary/ios/
 
 # Generated at build time
 README.md
+
+# Per-test scratch directories created by config-readers.test.ts
+tests/unit/fixtures/config-readers/case-*/
