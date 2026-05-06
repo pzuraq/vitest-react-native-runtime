@@ -15,11 +15,21 @@ import {
 
 // Anchor the per-test scratch directories inside the package's own
 // `tests/unit/fixtures/config-readers/` tree so vite's `loadConfigFromFile`
-// can resolve a bare `import 'vitest-mobile'` against the workspace's
-// node_modules walk-up. (Tmpdir-based fixtures fail because the
-// `.timestamp.mjs` file vite writes alongside the config can't see
-// vitest-mobile's `node_modules` siblings from `/private/var/folders/...`.)
+// can resolve relative imports and walk up to the package's node_modules
+// for any externals the source touches.
 const FIXTURES_ROOT = resolve(__dirname, 'fixtures', 'config-readers');
+
+// Import `nativePlugin` directly from the package source rather than via the
+// `'vitest-mobile'` package name. Going through the package name would
+// resolve to `dist/node/index.cjs`, which isn't built when CI runs `npm
+// test` directly after `npm ci` (the `lint-typecheck` job builds; the
+// `unit-tests` job doesn't). vite + esbuild compile the TS source on the
+// fly, so this works regardless of whether `dist/` exists, and crucially
+// it tests the SAME `nativePlugin` / `VITEST_MOBILE_PLUGIN_OPTIONS_KEY`
+// pair that the readers we're testing import from the source tree —
+// avoiding any subtle drift between source and built artifacts during
+// development.
+const NATIVE_PLUGIN_SOURCE = resolve(__dirname, '..', '..', 'src', 'node', 'index.ts');
 
 let tmp: string;
 
@@ -82,7 +92,7 @@ describe('readMetroCustomizerFromConfig', () => {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 const customize = (cfg) => ({ ...cfg, __marker: 'ios-customize' });
 
@@ -119,7 +129,7 @@ export default {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 export default {
   test: {
@@ -145,7 +155,7 @@ export default {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 const first = (cfg) => ({ ...cfg, order: [...(cfg.order ?? []), 'first'] });
 const second = (cfg) => ({ ...cfg, order: [...(cfg.order ?? []), 'second'] });
@@ -180,7 +190,7 @@ export default {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 const iosCustomize = (cfg) => ({ ...cfg, __marker: 'ios' });
 const androidCustomize = (cfg) => ({ ...cfg, __marker: 'android' });
@@ -217,7 +227,7 @@ describe('readBabelPluginsFromConfig', () => {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 export default {
   test: {
@@ -263,7 +273,7 @@ describe('readVitestMobilePluginOptions', () => {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 export default {
   test: {
@@ -302,7 +312,7 @@ export default {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 export default {
   test: {
@@ -330,7 +340,7 @@ export default {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 export default {
   test: {
@@ -363,7 +373,7 @@ export default {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 const plugin = nativePlugin({ platform: 'ios' });
 plugin.__vitestMobileOptions.nativeModules = ['legacy-only'];
@@ -389,7 +399,7 @@ describe('readNativeModulesFromConfig + resolveNativeModules', () => {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 export default {
   test: {
@@ -419,7 +429,7 @@ export default {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 export default {
   test: {
@@ -443,7 +453,7 @@ export default {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 const plugin = nativePlugin({ platform: 'ios' });
 plugin.__vitestMobileOptions.nativeModules = ['legacy-only'];
@@ -461,7 +471,7 @@ export default {
     writeConfig(
       'vitest.config.mjs',
       `
-import { nativePlugin } from 'vitest-mobile';
+import { nativePlugin } from ${JSON.stringify(NATIVE_PLUGIN_SOURCE)};
 
 export default {
   test: {
