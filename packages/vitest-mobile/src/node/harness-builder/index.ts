@@ -50,7 +50,11 @@ export type { HarnessBuildOptions, HarnessBuildResult };
 // v4: merge scaffolded package.json (preserves RN template devDeps incl. @react-native/metro-config)
 //     + preserve node_modules in trimBuildCache + exports "./package.json" for TurboModule
 //     autolinking. Old binaries built pre-v4 are missing VitestMobileHarness registration.
-const BUILD_FORMAT_VERSION = 5;
+// v6: auto-wire Expo modules via `install-expo-modules` whenever any user-supplied
+//     nativeModule matches the Expo naming convention (`expo`, `expo-*`, `@expo/*`).
+//     Old v5 binaries built with Expo modules listed as deps lacked the autolinking
+//     pipeline, so component renders that touched Expo modules' native side crashed.
+const BUILD_FORMAT_VERSION = 6;
 
 const BUILTIN_NATIVE_DEPS = ['react-native-safe-area-context'];
 
@@ -383,6 +387,8 @@ async function customizeProject(projectDir: string, options: HarnessBuildOptions
   //    react-native.config.cjs)
   //  - react-native-safe-area-context (used by our harness UI)
   //  - any user-supplied native modules
+  //  - `expo` (auto-added when any user-supplied module is an Expo module,
+  //    so `expo-modules-autolinking` can pick the rest up)
   const pkgPath = resolve(projectDir, 'package.json');
   const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
     name?: string;
@@ -404,6 +410,16 @@ async function customizeProject(projectDir: string, options: HarnessBuildOptions
   for (const mod of options.nativeModules) {
     dependencies[mod] = readInstalledVersion(options.projectRoot, mod) ?? '*';
   }
+
+  const needsExpoIntegration = hasExpoModule(options.nativeModules);
+  if (needsExpoIntegration && !dependencies['expo']) {
+    // Expo's autolinking machinery lives in the `expo` package. Pin to whatever
+    // the user has installed if available — otherwise let `install-expo-modules`
+    // pick a default compatible with the harness's RN version.
+    const userExpoVersion = readInstalledVersion(options.projectRoot, 'expo');
+    if (userExpoVersion) dependencies['expo'] = userExpoVersion;
+  }
+
   pkg.dependencies = dependencies;
 
   writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
@@ -414,6 +430,111 @@ async function customizeProject(projectDir: string, options: HarnessBuildOptions
   const depsStart = Date.now();
   await runLive('npm install', { cwd: projectDir });
   log.info(`  Dependencies installed (${((Date.now() - depsStart) / 1000).toFixed(1)}s)`);
+
+  if (needsExpoIntegration) {
+    log.info('Wiring up Expo modules autolinking...');
+    const expoStart = Date.now();
+    // `install-expo-modules` patches the harness's Podfile, settings.gradle,
+    // MainApplication, AppDelegate, etc. so that `expo-modules-autolinking`
+    // picks up every `expo-*` package the user listed in `nativeModules`.
+    // Without this, JS-side imports of e.g. `expo-blur` evaluate but the
+    // native pod isn't installed, so component renders crash with
+    // `Cannot read property 'BlurView' of undefined`.
+    //
+    // `--non-interactive` skips the AGP / iOS deployment-target / CLI
+    // integration prompts (all default to "yes"). The CLI integration
+    // (babel-preset-expo, expo/metro-config, .expo/.virtual-metro-entry
+    // bundle URL, Xcode "Bundle React Native code and images" phase) is
+    // mostly fine for the harness — vitest-mobile bundles tests through
+    // its own Metro config that requires @react-native/metro-config
+    // directly from the harness's node_modules, bypassing the harness's
+    // own metro.config.js entirely. The one piece we have to undo is the
+    // bundle-root rename (`index` → `.expo/.virtual-metro-entry`); vitest
+    // -mobile rewrites `/index.bundle` requests onto its prebuilt bundle
+    // path at the Metro server, but the `.expo/...` URL would slip past
+    // that rewrite and hit a 404.
+    await runLive('npx --yes install-expo-modules@latest --non-interactive', {
+      cwd: projectDir,
+    });
+    patchAppDelegateForExpo(projectDir);
+    log.info(`  Expo modules wired (${((Date.now() - expoStart) / 1000).toFixed(1)}s)`);
+  }
+}
+
+/**
+ * Patch the harness's AppDelegate.swift (iOS) and MainApplication.kt/.java
+ * (Android) after `install-expo-modules` runs:
+ *
+ *  1. Undo the bundle-root rename — the CLI integration retargets bundle
+ *     loading at `.expo/.virtual-metro-entry` so that Expo CLI's bundler
+ *     resolves the user's actual entry, but vitest-mobile is already
+ *     serving Metro itself and rewriting `/index.bundle` requests onto its
+ *     own pre-built bundle, so we keep the bundle root as plain `index`.
+ *
+ *  2. Add the `bindReactNativeFactory(factory)` call that SDK 54+'s
+ *     `ExpoAppDelegate.recreateRootView` requires. `install-expo-modules`
+ *     swaps the superclass to `ExpoAppDelegate` and the factory class to
+ *     `ExpoReactNativeFactory`, but doesn't insert `bindReactNativeFactory`
+ *     — yet `ExpoAppDelegate` reads its own private `factory` property at
+ *     `recreateRootView` time and `fatalError`s with
+ *     `"recreateRootView: Missing factory in ExpoAppDelegate"` if it's
+ *     unset. The from-scratch Expo bare template hard-codes this call;
+ *     we re-add it after the install-expo-modules transform.
+ *
+ * Searches for AppDelegate / MainApplication files by name rather than
+ * hard-coding the package path because the Android Java/Kotlin path follows
+ * the (rewritten) bundle ID and the iOS file lives inside the
+ * `HARNESS_APP_NAME` subdirectory.
+ */
+function patchAppDelegateForExpo(projectDir: string): void {
+  const targetNames = new Set(['AppDelegate.swift', 'AppDelegate.mm', 'MainApplication.kt', 'MainApplication.java']);
+
+  const searchDirs = [resolve(projectDir, 'ios'), resolve(projectDir, 'android')];
+  for (const root of searchDirs) {
+    if (!existsSync(root)) continue;
+    walkAndPatch(root, targetNames);
+  }
+}
+
+function walkAndPatch(dir: string, targetNames: Set<string>): void {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = resolve(dir, entry.name);
+    if (entry.isDirectory()) {
+      walkAndPatch(full, targetNames);
+      continue;
+    }
+    if (!targetNames.has(entry.name)) continue;
+    const before = readFileSync(full, 'utf8');
+    let after = before.replaceAll('.expo/.virtual-metro-entry', 'index');
+    after = ensureBindReactNativeFactoryCall(after, entry.name);
+    if (after !== before) writeFileSync(full, after);
+  }
+}
+
+/**
+ * Insert `bindReactNativeFactory(factory)` immediately after the
+ * `reactNativeFactory = factory` assignment in `AppDelegate.swift` if the
+ * call is missing. No-op for non-Swift files.
+ */
+function ensureBindReactNativeFactoryCall(contents: string, filename: string): string {
+  if (filename !== 'AppDelegate.swift') return contents;
+  if (contents.includes('bindReactNativeFactory(')) return contents;
+  // Match the assignment line so we can preserve its leading indent.
+  const m = contents.match(/^([ \t]*)reactNativeFactory\s*=\s*factory[ \t]*$/m);
+  if (!m) return contents;
+  const indent = m[1];
+  return contents.replace(m[0], `${m[0]}\n${indent}bindReactNativeFactory(factory)`);
+}
+
+/**
+ * Heuristic for "this nativeModule needs Expo's autolinking pipeline" —
+ * matches `expo`, `expo-*` (e.g. `expo-blur`, `expo-haptics`), and `@expo/*`
+ * (e.g. `@expo/vector-icons`). Modules outside this naming pattern go
+ * through the React Native community CLI's autolinking, which the
+ * scaffolded RN template already supports out of the box.
+ */
+function hasExpoModule(nativeModules: readonly string[]): boolean {
+  return nativeModules.some(name => name === 'expo' || name.startsWith('expo-') || name.startsWith('@expo/'));
 }
 
 /**
