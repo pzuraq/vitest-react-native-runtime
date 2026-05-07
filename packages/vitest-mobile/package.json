@@ -1,6 +1,6 @@
 {
   "name": "vitest-mobile",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Run Vitest component tests inside a real React Native app with native touch synthesis",
   "license": "MIT",
   "type": "module",
