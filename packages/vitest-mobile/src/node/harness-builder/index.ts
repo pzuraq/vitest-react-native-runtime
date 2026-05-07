@@ -453,13 +453,28 @@ async function customizeProject(projectDir: string, options: HarnessBuildOptions
     // -mobile rewrites `/index.bundle` requests onto its prebuilt bundle
     // path at the Metro server, but the `.expo/...` URL would slip past
     // that rewrite and hit a 404.
-    await runLive('npx --yes install-expo-modules@latest --non-interactive', {
+    //
+    // Pin to `INSTALL_EXPO_MODULES_VERSION` rather than `@latest` — `0.14.18`
+    // (currently tagged `latest` upstream) ships without the
+    // `process.platform === 'darwin'` gate around `pod install`, so it
+    // crashes with `ENOENT spawn pod` on Linux runners (Android-only CI).
+    // `0.14.21` has the gate. Bump when a newer known-good version ships.
+    await runLive(`npx --yes install-expo-modules@${INSTALL_EXPO_MODULES_VERSION} --non-interactive`, {
       cwd: projectDir,
     });
     patchAppDelegateForExpo(projectDir);
     log.info(`  Expo modules wired (${((Date.now() - expoStart) / 1000).toFixed(1)}s)`);
   }
 }
+
+/**
+ * Pinned version of `install-expo-modules` — `0.14.18` (the upstream
+ * `latest` tag) ships without the `process.platform === 'darwin'` gate
+ * around `pod install`, so it crashes on Linux. `0.14.21` has the gate
+ * and is the newest stable as of this pin. Bump when a newer known-good
+ * version ships.
+ */
+const INSTALL_EXPO_MODULES_VERSION = '0.14.21';
 
 /**
  * Patch the harness's AppDelegate.swift (iOS) and MainApplication.kt/.java
